@@ -1,5 +1,11 @@
 # Display Access Android sample
 
+## Diagnostic update
+
+For an immediate **Session ended by device** error, use [diagnostic update 1](./DisplayAccess-diagnostics-1.zip). It adds **Settings → Connection details → Copy connection details**, so startup events can be shared from the phone. See the [installation and reporting steps](./DisplayAccess-diagnostics-1-INSTALL.md) and [source changes](./DisplayAccess-diagnostics-1.patch). This update collects evidence; it is not a confirmed fix. The original sample package remains below.
+
+## Original sample
+
 [Download the APK package (ZIP, 26.4 MiB)](./DisplayAccess-download.zip)
 
 This package contains the debug-signed APK built from [Meta's official DisplayAccess sample](https://github.com/facebook/meta-wearables-dat-android/tree/main/samples/DisplayAccess), an APK checksum, installation instructions, and Meta's sample license. The official sample source and dependency declarations were left unchanged. The sample displays a car-maintenance tutorial on compatible glasses; it does not stream the phone's camera.
