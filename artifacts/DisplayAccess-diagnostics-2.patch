@@ -1,0 +1,660 @@
+--- /dev/null
++++ b/app/src/main/java/com/meta/wearable/dat/externalsampleapps/displayaccess/DiagnosticOptions.kt
+@@ -0,0 +1,16 @@
++package com.meta.wearable.dat.externalsampleapps.displayaccess
++
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++
++/** Temporary test options; reset when the app process restarts. */
++object DiagnosticOptions {
++  private val _includeDetailImages = MutableStateFlow(false)
++  val includeDetailImages: StateFlow<Boolean> = _includeDetailImages.asStateFlow()
++
++  fun setIncludeDetailImages(enabled: Boolean) {
++    _includeDetailImages.value = enabled
++    SessionDiagnostics.record("Detail image comparison setting: enabled=$enabled")
++  }
++}
+--- a/app/src/main/java/com/meta/wearable/dat/externalsampleapps/displayaccess/MainActivity.kt
++++ b/app/src/main/java/com/meta/wearable/dat/externalsampleapps/displayaccess/MainActivity.kt
+@@ -32,15 +32,24 @@
+   private val permissionsLauncher =
+       registerForActivityResult(RequestMultiplePermissions()) { results ->
+         if (results.entries.all { it.value }) {
++          SessionDiagnostics.record("Android permissions granted")
+           Wearables.initialize(this)
++              .onSuccess {
++                SessionDiagnostics.record("SDK initialized; app developer configuration=${Wearables.isDevMode}")
++              }
++              .onFailure { error, _ ->
++                SessionDiagnostics.record("SDK initialization error: ${error.description}")
++              }
+           wearablesViewModel.startObserving()
+         } else {
++          SessionDiagnostics.record("Required Android permission missing")
+           Toast.makeText(this, "All permissions are required", Toast.LENGTH_SHORT).show()
+         }
+       }
+ 
+   override fun onCreate(savedInstanceState: Bundle?) {
+     super.onCreate(savedInstanceState)
++    SessionDiagnostics.record("Activity opened; Android API ${android.os.Build.VERSION.SDK_INT}")
+     enableEdgeToEdge()
+     setContent { DisplayAccessTheme { AppScaffold(wearablesViewModel = wearablesViewModel) } }
+   }
+--- /dev/null
++++ b/app/src/main/java/com/meta/wearable/dat/externalsampleapps/displayaccess/SessionDiagnostics.kt
+@@ -0,0 +1,33 @@
++package com.meta.wearable.dat.externalsampleapps.displayaccess
++
++import android.os.SystemClock
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++
++/** A bounded, in-memory trace shared only when the user copies it. */
++object SessionDiagnostics {
++  private const val LIMIT = 100
++  private val lock = Any()
++  private val startedAt = SystemClock.elapsedRealtime()
++  private val _events = MutableStateFlow<List<String>>(emptyList())
++  val events: StateFlow<List<String>> = _events.asStateFlow()
++
++  fun record(event: String) {
++    synchronized(lock) {
++      val elapsed = SystemClock.elapsedRealtime() - startedAt
++      _events.value = (_events.value + "+${elapsed}ms $event").takeLast(LIMIT)
++    }
++  }
++
++  fun report(): String =
++      "Display Access diagnostic update 2\nSDK 1.0.1; Android API ${android.os.Build.VERSION.SDK_INT}\n" +
++          "Detail images enabled=${DiagnosticOptions.includeDetailImages.value}\n" +
++          "App developer configuration is not a check of companion Developer Mode.\n\n" +
++          _events.value.joinToString("\n")
++
++  fun clear() {
++    synchronized(lock) { _events.value = emptyList() }
++    record("Previous events cleared")
++  }
++}
+--- a/app/src/main/java/com/meta/wearable/dat/externalsampleapps/displayaccess/display/DisplayViewModel.kt
++++ b/app/src/main/java/com/meta/wearable/dat/externalsampleapps/displayaccess/display/DisplayViewModel.kt
+@@ -44,11 +44,14 @@
+ import com.meta.wearable.dat.display.views.TextColor
+ import com.meta.wearable.dat.display.views.TextStyle
+ import com.meta.wearable.dat.display.views.VideoPlayer
++import com.meta.wearable.dat.externalsampleapps.displayaccess.DiagnosticOptions
+ import com.meta.wearable.dat.externalsampleapps.displayaccess.R
+ import com.meta.wearable.dat.externalsampleapps.displayaccess.SampleApp
++import com.meta.wearable.dat.externalsampleapps.displayaccess.SessionDiagnostics
+ import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.CoroutineDispatcher
+ import kotlinx.coroutines.CoroutineExceptionHandler
++import kotlinx.coroutines.CoroutineStart
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.flow.MutableStateFlow
+@@ -189,12 +192,15 @@
+ 
+   private val sessionObserverExceptionHandler = CoroutineExceptionHandler { _, throwable ->
+     Log.e(TAG, "Session state observer failed", throwable)
++    SessionDiagnostics.record("Session observer failed; see local Android logs")
+   }
+   private val displayObserverExceptionHandler = CoroutineExceptionHandler { _, throwable ->
+     Log.e(TAG, "Display state observer failed", throwable)
++    SessionDiagnostics.record("Display observer failed; see local Android logs")
+   }
+   private val sendContentExceptionHandler = CoroutineExceptionHandler { _, throwable ->
+     Log.e(TAG, "Sending display content failed", throwable)
++    SessionDiagnostics.record("Content operation threw an exception; see local Android logs")
+     _uiState.value =
+         _uiState.value.copy(
+             isSending = false,
+@@ -211,7 +217,9 @@
+   @GuardedBy("sessionLock") private var displayStateJob: Job? = null
+   @GuardedBy("sessionLock") private var pendingDisplayAttachment = false
+   @GuardedBy("sessionLock") private var pendingSample: SampleApp? = null
+-  private var tutorialVideoStateJob: Job? = null
++  @GuardedBy("sessionLock") private var tutorialVideoStateJob: Job? = null
++  @GuardedBy("sessionLock") private var tutorialVideoErrorJob: Job? = null
++  @GuardedBy("sessionLock") private var tutorialVideoObservation: Any? = null
+ 
+   // -- Session lifecycle --
+ 
+@@ -220,6 +228,7 @@
+       selectedDeviceId: DeviceIdentifier?,
+   ) {
+     Log.d(TAG, "Starting DAT session")
++    SessionDiagnostics.record("Session creation requested")
+     _uiState.value =
+         _uiState.value.copy(
+             selectedDeviceId = selectedDeviceId,
+@@ -234,11 +243,13 @@
+     val result = Wearables.createSession(deviceSelector)
+     result.fold(
+         onSuccess = { newSession ->
++          SessionDiagnostics.record("Session created")
+           synchronized(sessionLock) { session = newSession }
+ 
+           val stateJob =
+               viewModelScope.launch(sessionObserverExceptionHandler) {
+                 newSession.state.collect { state ->
++                  SessionDiagnostics.record("Session state: ${state.name}")
+                   when (state) {
+                     DeviceSessionState.STARTED -> {
+                       Log.i(TAG, "Session started")
+@@ -286,9 +297,14 @@
+               }
+           replaceSessionErrorJob(errorJob)
+ 
++          SessionDiagnostics.record("Session start requested")
+           newSession.start()
++          SessionDiagnostics.record("Session start returned; waiting for state or error")
+         },
+         onFailure = { error, _ ->
++          SessionDiagnostics.record(
++              "Session creation failed: ${error.name}: ${error.getLocalizedDescription(getApplication())}",
++          )
+           Log.e(TAG, "Failed to create session: ${error.description}")
+           clearPendingWork()
+           _uiState.value =
+@@ -343,6 +359,7 @@
+     val currentSession =
+         synchronized(sessionLock) { session }
+             ?: run {
++              SessionDiagnostics.record("Display attachment blocked: no active session")
+               clearPendingWork()
+               _uiState.value =
+                   _uiState.value.copy(
+@@ -356,12 +373,14 @@
+             }
+ 
+     Log.d(TAG, "Attaching display")
++    SessionDiagnostics.record("Display attachment requested")
+     _uiState.value = _uiState.value.copy(snackbarMessage = "Attaching display...")
+ 
+     currentSession
+         .addDisplay()
+         .fold(
+             onSuccess = { newDisplay ->
++              SessionDiagnostics.record("Display attached")
+               synchronized(sessionLock) { display = newDisplay }
+               Log.i(TAG, "Display attached")
+               _uiState.value =
+@@ -375,6 +394,7 @@
+                   viewModelScope.launch(displayObserverExceptionHandler) {
+                     var hasStarted = false
+                     newDisplay.state.collect { state ->
++                      SessionDiagnostics.record("Display state: ${state.name}")
+                       Log.i(TAG, "Display state: $state")
+                       _uiState.value =
+                           _uiState.value.copy(
+@@ -403,6 +423,9 @@
+               replaceDisplayStateJob(stateJob)
+             },
+             onFailure = { error, _ ->
++              SessionDiagnostics.record(
++                  "Display attachment failed: ${error.name}: ${error.getLocalizedDescription(getApplication())}",
++              )
+               Log.e(TAG, "Failed to attach display: ${error.description}")
+               clearPendingWork()
+               _uiState.value =
+@@ -419,7 +442,8 @@
+ 
+   // -- Content --
+ 
+-  private fun sendContent(content: ContentScope.() -> Unit) {
++  private fun sendContent(diagnosticLabel: String, content: ContentScope.() -> Unit) {
++    SessionDiagnostics.record("Content send [$diagnosticLabel] requested")
+     _uiState.value =
+         _uiState.value.copy(
+             isSending = true,
+@@ -430,6 +454,7 @@
+       val currentDisplay =
+           synchronized(sessionLock) { display }
+               ?: run {
++                SessionDiagnostics.record("Content send [$diagnosticLabel] blocked: no display attached")
+                 _uiState.value =
+                     _uiState.value.copy(
+                         isSending = false,
+@@ -443,6 +468,7 @@
+       val result = currentDisplay.sendContent(content)
+       result.fold(
+           onSuccess = {
++            SessionDiagnostics.record("Content send [$diagnosticLabel] succeeded")
+             _uiState.value =
+                 _uiState.value.copy(
+                     isSending = false,
+@@ -452,6 +478,9 @@
+                 )
+           },
+           onFailure = { error, _ ->
++            SessionDiagnostics.record(
++                "Content send [$diagnosticLabel] failed: ${error.name}: ${error.getLocalizedDescription(getApplication())}",
++            )
+             _uiState.value =
+                 _uiState.value.copy(
+                     isSending = false,
+@@ -467,6 +496,7 @@
+   // -- Sample management --
+ 
+   fun sendSampleToDisplay(sample: SampleApp) {
++    SessionDiagnostics.record("Main Try it requested: ${sample.name}")
+     queueOrSendSample(
+         sample = sample,
+         deviceSelector = AutoDeviceSelector(filter = { it.isDisplayCapable() }),
+@@ -478,6 +508,7 @@
+       sample: SampleApp,
+       deviceId: DeviceIdentifier,
+   ) {
++    SessionDiagnostics.record("Mock preview sample requested: ${sample.name}")
+     queueOrSendSample(
+         sample = sample,
+         deviceSelector = SpecificDeviceSelector(deviceId),
+@@ -515,6 +546,7 @@
+   }
+ 
+   private fun sendSampleContent(sample: SampleApp) {
++    SessionDiagnostics.record("Sending sample content: ${sample.name}")
+     Log.i(TAG, "Sending sample to display: ${sample.name}")
+     when (sample) {
+       SampleApp.CAR_MAINTENANCE -> displayCarMaintenanceScreen()
+@@ -528,6 +560,7 @@
+   }
+ 
+   private fun detachDisplay() {
++    SessionDiagnostics.record("Display detach requested by app")
+     Log.d(TAG, "Detaching display")
+     synchronized(sessionLock) { session }?.removeDisplay()
+     cleanupDisplay()
+@@ -546,6 +579,7 @@
+   }
+ 
+   private fun stopSessionImmediately(): Boolean {
++    SessionDiagnostics.record("Session stop requested by app")
+     return try {
+       Log.d(TAG, "Stopping session")
+       clearPendingWork()
+@@ -595,13 +629,35 @@
+   }
+ 
+   private fun cleanupDisplay() {
+-    tutorialVideoStateJob?.cancel()
+-    tutorialVideoStateJob = null
++    clearTutorialVideoObservers()
+     clearDisplayStateJob()?.cancel()
+     synchronized(sessionLock) { display = null }
+   }
+ 
++  private fun clearTutorialVideoObservers(expectedObservation: Any? = null): Boolean {
++    val jobs =
++        synchronized(sessionLock) {
++          if (expectedObservation != null && tutorialVideoObservation !== expectedObservation) {
++            return false
++          }
++          tutorialVideoObservation = null
++          val observers = tutorialVideoStateJob to tutorialVideoErrorJob
++          tutorialVideoStateJob = null
++          tutorialVideoErrorJob = null
++          observers
++        }
++    jobs.first?.cancel()
++    jobs.second?.cancel()
++    return true
++  }
++
++  private fun isCurrentVideoObservation(observation: Any): Boolean =
++      synchronized(sessionLock) { tutorialVideoObservation === observation }
++
+   private fun handleSessionError(error: DeviceSessionError) {
++    SessionDiagnostics.record(
++        "Session error: ${error.name}: ${error.getLocalizedDescription(getApplication())}",
++    )
+     Log.e(TAG, "Session error: ${error.description}")
+     clearPendingWork()
+     cleanupDisplay()
+@@ -627,14 +683,19 @@
+   }
+ 
+   private fun displayCarMaintenanceScreen() {
+-    sendContent { carMaintenanceTutorialListContent() }
++    SessionDiagnostics.record("Menu callback entered")
++    sendContent("menu") { carMaintenanceTutorialListContent() }
+   }
+ 
+   private fun displayCarMaintenanceTutorialDetail(tutorial: CarMaintenanceTutorial) {
+-    sendContent {
++    val includeDetailImages = DiagnosticOptions.includeDetailImages.value
++    SessionDiagnostics.record(
++        "Detail callback entered: ${tutorial.title}; images=$includeDetailImages",
++    )
++    sendContent("detail/${tutorial.title}; images=$includeDetailImages") {
+       flexBox(direction = Direction.COLUMN, gap = 12) {
+         flexBox(padding = 24, background = FlexBoxBackground.CARD) {
+-          tutorialImage(tutorial.imageRes, tutorial.imageUri)
++          if (includeDetailImages) tutorialImage(tutorial.imageRes, tutorial.imageUri)
+           text(tutorial.title, style = TextStyle.HEADING)
+           text(tutorial.duration, style = TextStyle.META, color = TextColor.SECONDARY)
+         }
+@@ -664,6 +725,7 @@
+       tutorial: CarMaintenanceTutorial,
+       stepIndex: Int,
+   ) {
++    SessionDiagnostics.record("Video callback entered: ${tutorial.title}; step=${stepIndex + 1}")
+     viewModelScope.launch(dispatcher + sendContentExceptionHandler) {
+       val currentDisplay =
+           synchronized(sessionLock) { display }
+@@ -677,25 +739,90 @@
+           codec = VideoCodec.MP4,
+       )
+ 
+-      val result = currentDisplay.sendContent { video(player = player) }
++      clearTutorialVideoObservers()
++      val observation = Any()
++      val canObserve =
++          synchronized(sessionLock) {
++            if (display !== currentDisplay) {
++              false
++            } else {
++              tutorialVideoObservation = observation
++              true
++            }
++          }
++      if (!canObserve) return@launch
++
++      val stateJob =
++          viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
++            player.state.collect { state ->
++              if (!isCurrentVideoObservation(observation)) return@collect
++              SessionDiagnostics.record("Video player state: ${state.name}")
++              if (state == VideoPlayerState.ENDED && clearTutorialVideoObservers(observation)) {
++                val canReturnToStep =
++                    synchronized(sessionLock) {
++                      display === currentDisplay && tutorialVideoObservation == null
++                    }
++                if (canReturnToStep) displayCarMaintenanceTutorialStep(tutorial, stepIndex)
++              }
++            }
++          }
++      val errorJob =
++          viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
++            player.error.collect { error ->
++              if (!isCurrentVideoObservation(observation)) return@collect
++              if (error == null) {
++                SessionDiagnostics.record("Video player error: none")
++              } else {
++                SessionDiagnostics.record(
++                    "Video player error: ${error.name}: ${error.getLocalizedDescription(getApplication())}",
++                )
++              }
++            }
++          }
++      val observersRetained =
++          synchronized(sessionLock) {
++            if (tutorialVideoObservation !== observation) {
++              false
++            } else {
++              tutorialVideoStateJob = stateJob
++              tutorialVideoErrorJob = errorJob
++              true
++            }
++          }
++      if (!observersRetained) {
++        stateJob.cancel()
++        errorJob.cancel()
++        return@launch
++      }
++
++      SessionDiagnostics.record("Video content send requested")
++      val result =
++          try {
++            currentDisplay.sendContent { video(player = player) }
++          } catch (error: Throwable) {
++            clearTutorialVideoObservers(observation)
++            throw error
++          }
+       result.fold(
+           onSuccess = {
+-            tutorialVideoStateJob?.cancel()
+-            tutorialVideoStateJob = viewModelScope.launch {
+-              player.state.collect { state ->
+-                if (state == VideoPlayerState.ENDED) {
+-                  tutorialVideoStateJob?.cancel()
+-                  tutorialVideoStateJob = null
+-                  displayCarMaintenanceTutorialStep(tutorial, stepIndex)
+-                }
++            SessionDiagnostics.record("Video content send succeeded")
++            synchronized(sessionLock) {
++              if (tutorialVideoObservation === observation && display === currentDisplay) {
++                _uiState.value = _uiState.value.copy(snackbarMessage = "Starting video...")
++                SessionDiagnostics.record("Video play requested")
++                player.play()
++                SessionDiagnostics.record("Video play returned; waiting for player state or error")
+               }
+             }
+-            _uiState.value = _uiState.value.copy(snackbarMessage = "Starting video...")
+-            player.play()
+           },
+           onFailure = { error, _ ->
+-            _uiState.value =
+-                _uiState.value.copy(snackbarMessage = "Send failed: ${error.description}")
++            SessionDiagnostics.record(
++                "Video content send failed: ${error.name}: ${error.getLocalizedDescription(getApplication())}",
++            )
++            if (clearTutorialVideoObservers(observation)) {
++              _uiState.value =
++                  _uiState.value.copy(snackbarMessage = "Send failed: ${error.description}")
++            }
+           },
+       )
+     }
+@@ -707,7 +834,8 @@
+   ) {
+     val clampedIndex = stepIndex.coerceIn(0, tutorial.steps.lastIndex)
+     val step = tutorial.steps[clampedIndex]
+-    sendContent {
++    SessionDiagnostics.record("Step callback entered: ${tutorial.title}; step=${clampedIndex + 1}")
++    sendContent("step/${tutorial.title}/${clampedIndex + 1}") {
+       flexBox(direction = Direction.COLUMN, gap = 12) {
+         flexBox(padding = 24, background = FlexBoxBackground.CARD) {
+           text(
+--- a/app/src/main/java/com/meta/wearable/dat/externalsampleapps/displayaccess/ui/ConnectScreen.kt
++++ b/app/src/main/java/com/meta/wearable/dat/externalsampleapps/displayaccess/ui/ConnectScreen.kt
+@@ -132,6 +132,10 @@
+         uiState = uiState,
+         mockDisplayDeviceId = mockDisplayDeviceId,
+     )
++
++    Spacer(modifier = Modifier.height(24.dp))
++    ConnectionDiagnosticsCard()
++    Spacer(modifier = Modifier.height(24.dp))
+   }
+ }
+ 
+--- /dev/null
++++ b/app/src/main/java/com/meta/wearable/dat/externalsampleapps/displayaccess/ui/ConnectionDiagnosticsCard.kt
+@@ -0,0 +1,98 @@
++package com.meta.wearable.dat.externalsampleapps.displayaccess.ui
++
++import android.content.ClipData
++import android.content.ClipboardManager
++import android.content.Context
++import android.widget.Toast
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.selection.toggleable
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.text.selection.SelectionContainer
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.material3.Button
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.semantics.Role
++import androidx.compose.ui.text.font.FontFamily
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import com.meta.wearable.dat.externalsampleapps.displayaccess.DiagnosticOptions
++import com.meta.wearable.dat.externalsampleapps.displayaccess.SessionDiagnostics
++
++@Composable
++fun ConnectionDiagnosticsCard() {
++  val events by SessionDiagnostics.events.collectAsStateWithLifecycle()
++  val includeDetailImages by DiagnosticOptions.includeDetailImages.collectAsStateWithLifecycle()
++  val context = LocalContext.current
++  Column(
++      modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(26.dp))
++          .background(Color.White).padding(20.dp),
++      verticalArrangement = Arrangement.spacedBy(10.dp),
++  ) {
++    Text("Connection details", style = MaterialTheme.typography.titleLarge, color = Color.Black)
++    Text(
++        "Diagnostic update 2. The detail screen starts without its large image for comparison. Try the sample once, then return here to copy the details.",
++        style = MaterialTheme.typography.bodyMedium,
++        color = Color.DarkGray,
++    )
++    Row(
++        modifier = Modifier.fillMaxWidth().toggleable(
++            value = includeDetailImages,
++            role = Role.Switch,
++            onValueChange = DiagnosticOptions::setIncludeDetailImages,
++        ),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++      Text(
++          "Include large tutorial image",
++          modifier = Modifier.weight(1f).padding(end = 12.dp),
++          style = MaterialTheme.typography.bodyMedium,
++          color = Color.Black,
++      )
++      Switch(
++          checked = includeDetailImages,
++          onCheckedChange = null,
++      )
++    }
++    SelectionContainer {
++      Text(
++          text = events.takeLast(30).joinToString("\n").ifEmpty { "Waiting for connection events…" },
++          modifier = Modifier.fillMaxWidth().heightIn(max = 240.dp)
++              .verticalScroll(rememberScrollState()),
++          style = MaterialTheme.typography.bodySmall,
++          fontFamily = FontFamily.Monospace,
++          color = Color.Black,
++      )
++    }
++    Button(
++        onClick = {
++          val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
++          clipboard.setPrimaryClip(ClipData.newPlainText("Display Access connection details", SessionDiagnostics.report()))
++          Toast.makeText(context, "Connection details copied", Toast.LENGTH_SHORT).show()
++        },
++        modifier = Modifier.fillMaxWidth(),
++    ) { Text("Copy connection details") }
++    TextButton(onClick = { SessionDiagnostics.clear() }) { Text("Clear details") }
++    Text(
++        "Stored only while the app is running. No automatic upload; device names and identifiers are excluded.",
++        style = MaterialTheme.typography.bodySmall,
++        color = Color.DarkGray,
++    )
++  }
++}
+--- a/app/src/main/java/com/meta/wearable/dat/externalsampleapps/displayaccess/wearables/WearablesRepository.kt
++++ b/app/src/main/java/com/meta/wearable/dat/externalsampleapps/displayaccess/wearables/WearablesRepository.kt
+@@ -16,6 +16,7 @@
+ import com.meta.wearable.dat.core.types.Device
+ import com.meta.wearable.dat.core.types.DeviceIdentifier
+ import com.meta.wearable.dat.core.types.RegistrationState
++import com.meta.wearable.dat.externalsampleapps.displayaccess.SessionDiagnostics
+ import com.meta.wearable.dat.mockdevice.MockDeviceKit
+ import com.meta.wearable.dat.mockdevice.api.GlassesModel
+ import com.meta.wearable.dat.mockdevice.api.MockDeviceKitError
+@@ -61,6 +62,7 @@
+ 
+   private val monitoringExceptionHandler = CoroutineExceptionHandler { _, throwable ->
+     Log.e(TAG, "Wearables monitoring failed", throwable)
++    SessionDiagnostics.record("Wearables monitoring failed; see local Android logs")
+   }
+ 
+   private var monitoringStarted = false
+@@ -70,10 +72,16 @@
+     monitoringStarted = true
+ 
+     scope.launch(monitoringExceptionHandler) {
+-      Wearables.registrationState.collect { value -> _registrationState.value = value }
++      Wearables.registrationState.collect { value ->
++        SessionDiagnostics.record("Registration state: ${value.name}")
++        _registrationState.value = value
++      }
+     }
+     scope.launch(monitoringExceptionHandler) {
+       Wearables.registrationErrorStream.collect { error ->
++        SessionDiagnostics.record(
++            "Registration error: ${error.name}: ${error.getLocalizedDescription(applicationContext)}",
++        )
+         Log.e(TAG, error.getLocalizedDescription(applicationContext))
+       }
+     }
+@@ -83,6 +91,7 @@
+   }
+ 
+   private fun updateDevices(identifiers: Set<DeviceIdentifier>) {
++    SessionDiagnostics.record("Available device count: ${identifiers.size}")
+     _devices.value = identifiers
+     val current = _devicesMetadata.value
+     val removed = current.keys - identifiers
+@@ -100,14 +109,28 @@
+   }
+ 
+   private fun updateMetadata(id: DeviceIdentifier, device: Device) {
+-    synchronized(lock) { _devicesMetadata.update { it.toMutableMap().apply { put(id, device) } } }
+-  }
++    synchronized(lock) {
++      val previous = _devicesMetadata.value[id]
++      val metadata = diagnosticMetadata(device)
++      if (previous == null || diagnosticMetadata(previous) != metadata) {
++        SessionDiagnostics.record("Device metadata: $metadata")
++      }
++      _devicesMetadata.update { it.toMutableMap().apply { put(id, device) } }
++    }
++  }
++
++  private fun diagnosticMetadata(device: Device): String =
++      "type=${device.deviceType.name}, compatibility=${device.compatibility.name}, " +
++          "link=${device.linkState.name}, displayCapable=${device.isDisplayCapable()}, " +
++          "battery=${device.batteryLevel}, worn=${device.donState.name}, " +
++          "hinge=${device.hingeState.name}, thermal=${device.thermalLevel.name}"
+ 
+   fun startRegistration(activity: Activity) {
+     if (_registrationState.value == RegistrationState.REGISTERED) {
+       Log.d(TAG, "Already registered")
+       return
+     }
++    SessionDiagnostics.record("Registration requested")
+     Wearables.startRegistration(activity)
+   }
+ 
+@@ -116,6 +139,7 @@
+       Log.d(TAG, "Not registered")
+       return
+     }
++    SessionDiagnostics.record("Unregistration requested")
+     Wearables.startUnregistration(activity)
+   }
+ 

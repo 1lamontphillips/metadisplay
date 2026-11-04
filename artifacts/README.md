@@ -2,7 +2,9 @@
 
 ## Diagnostic update
 
-For an immediate **Session ended by device** error, use [diagnostic update 1](./DisplayAccess-diagnostics-1.zip). It adds **Settings → Connection details → Copy connection details**, so startup events can be shared from the phone. See the [installation and reporting steps](./DisplayAccess-diagnostics-1-INSTALL.md) and [source changes](./DisplayAccess-diagnostics-1.patch). This update collects evidence; it is not a confirmed fix. The original sample package remains below.
+For a session that starts but ends when opening a tutorial, use [diagnostic update 2](./DisplayAccess-diagnostics-2.zip). It starts the detail screen without its large image for comparison and labels menu/detail/step and video events. See the [test instructions](./DisplayAccess-diagnostics-2-INSTALL.md) and [source changes](./DisplayAccess-diagnostics-2.patch). This is a controlled isolation test, not a confirmed fix.
+
+[Diagnostic update 1](./DisplayAccess-diagnostics-1.zip) remains available for the earlier startup trace. Both updates add **Settings → Connection details → Copy connection details**. The original sample package remains below.
 
 ## Original sample
 
