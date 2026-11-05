@@ -9,6 +9,7 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
@@ -69,6 +70,10 @@ public final class LiveClipHttpServerTest {
     tests.add(new NamedCase("one-minute quota supports a cross-slot range", LiveClipHttpServerTest::minuteRange));
     tests.add(new NamedCase("one-minute quota waits for a future tail range", LiveClipHttpServerTest::minuteFutureTail));
     tests.add(new NamedCase("one-minute waiting source remains cancelable", LiveClipHttpServerTest::minuteStop));
+    tests.add(new NamedCase("five-minute quota streams300 exact slots with matching hash", LiveClipHttpServerTest::fiveMinuteGet));
+    tests.add(new NamedCase("five-minute range crosses the final slot boundary", LiveClipHttpServerTest::fiveMinuteRange));
+    tests.add(new NamedCase("five-minute tail range waits for future production", LiveClipHttpServerTest::fiveMinuteFutureTail));
+    tests.add(new NamedCase("five-minute future range remains promptly cancelable", LiveClipHttpServerTest::fiveMinuteStop));
     int failed = 0;
     for (NamedCase test : tests) {
       try {
@@ -401,13 +406,13 @@ public final class LiveClipHttpServerTest {
   private static void deadlineValidation() throws Exception {
     try (BoundedMediaBuffer source = source(false)) {
       InetAddress address = InetAddress.getByAddress(new byte[] {127, 0, 0, 1});
-      for (long invalid : new long[] {Long.MIN_VALUE, -1, 0, 180001, Long.MAX_VALUE}) {
+      for (long invalid : new long[] {Long.MIN_VALUE, -1, 0, 900001, Long.MAX_VALUE}) {
         try {
           new LiveClipHttpServer(source, address, invalid, event -> {});
           throw new AssertionError("invalid deadline accepted: " + invalid);
         } catch (IllegalArgumentException expected) { }
       }
-      for (long accepted : new long[] {1, 75000, 150000, 180000}) {
+      for (long accepted : new long[] {1, 75000, 150000, 180000, 660000, 900000}) {
         try (LiveClipHttpServer server = new LiveClipHttpServer(source, address, accepted, event -> {})) {
           equal(accepted, server.getResponseLimitMs(), "selected bounded deadline retained");
         }
@@ -562,10 +567,144 @@ public final class LiveClipHttpServerTest {
     }
   }
 
+  private static void fiveMinuteGet() throws Exception {
+    LiveSessionPlan plan = LiveSessionPlan.FIVE_MINUTES;
+    int total = Math.toIntExact(INIT.length + plan.getSlotPayloadBytes());
+    MessageDigest expected = MessageDigest.getInstance("SHA-256");
+    MessageDigest actual = MessageDigest.getInstance("SHA-256");
+    expected.update(INIT);
+    for (int i = 0; i < plan.getFragmentCount(); i++) expected.update(wideSlot(plan.getSlotBytes(), i + 1));
+    try (BoundedMediaBuffer source = new BoundedMediaBuffer(plan.getFragmentCount(), plan.getSlotBytes());
+        LiveClipHttpServer server = plannedServer(source, plan)) {
+      source.onInitialization(INIT);
+      server.start();
+      try (Client client = request(server, "GET", "");
+          SyntheticProducer producer = new SyntheticProducer(source, plan.getFragmentCount(), plan.getSlotBytes(), 1, true)) {
+        headers(client, 200, total);
+        equal(660000, server.getResponseLimitMs(), "five-minute response deadline selected");
+        byte[] initial = client.readFixed(INIT.length);
+        equalBytes(INIT, initial, "five-minute initialization arrives before capture completes");
+        actual.update(initial);
+        client.expectWaiting();
+        producer.start();
+        byte[] chunk = new byte[16384];
+        int remaining = total - initial.length;
+        while (remaining > 0) {
+          int amount = client.input.read(chunk, 0, Math.min(chunk.length, remaining));
+          check(amount > 0, "five-minute transfer reaches every promised byte");
+          actual.update(chunk, 0, amount);
+          remaining -= amount;
+        }
+        client.expectEof();
+        producer.awaitSuccess();
+        check(Arrays.equals(expected.digest(), actual.digest()), "300-slot body hash matches exact produced bytes");
+        LiveClipHttpServer.TransferSnapshot done = awaitSnapshot(server,
+            value -> value.responseComplete && value.activeGetCount == 0);
+        equal(total, done.bytesSent, "five-minute exact transmission length");
+        equal(total, done.sourceBytesProduced, "five-minute source byte count");
+        equal(300, source.getCompletedSlots(), "all300 planned slots complete");
+        equal(1, done.totalGetCount, "one continuous response, no clip rollover");
+        check(done.payloadComplete && source.isComplete(), "full five-minute budget completed");
+      }
+    }
+  }
+
+  private static void fiveMinuteRange() throws Exception {
+    LiveSessionPlan plan = LiveSessionPlan.FIVE_MINUTES;
+    try (BoundedMediaBuffer source = new BoundedMediaBuffer(plan.getFragmentCount(), plan.getSlotBytes());
+        LiveClipHttpServer server = plannedServer(source, plan)) {
+      source.onInitialization(INIT);
+      for (int i = 0; i < plan.getFragmentCount(); i++) source.onFragment(wideSlot(plan.getSlotBytes(), i + 1));
+      source.onComplete();
+      server.start();
+      int start = INIT.length + 299 * plan.getSlotBytes() - 11;
+      int end = start + 32;
+      try (Client client = request(server, "GET", "Range: bytes=" + start + "-" + end + "\r\n")) {
+        headers(client, 206, end - start + 1);
+        equal("bytes " + start + "-" + end + "/" + source.getContentLength(),
+            client.header("content-range"), "range keeps actual300-slot full length");
+        byte[] expected = new byte[end - start + 1];
+        for (int i = 0; i < expected.length; i++) expected[i] = fiveMinuteByte(start + i, plan.getSlotBytes());
+        equalBytes(expected, client.readFixed(expected.length), "slots299/300 boundary bytes intact");
+        client.expectEof();
+      }
+      int last = Math.toIntExact(source.getContentLength() - 1);
+      try (Client client = request(server, "GET", "Range: bytes=" + last + "-99999999\r\n")) {
+        headers(client, 206, 1);
+        equal(fiveMinuteByte(last, plan.getSlotBytes()) & 255, client.readFixed(1)[0] & 255,
+            "last-byte range clamps without exceeding truthful length");
+        client.expectEof();
+      }
+    }
+  }
+
+  private static void fiveMinuteFutureTail() throws Exception {
+    LiveSessionPlan plan = LiveSessionPlan.FIVE_MINUTES;
+    try (BoundedMediaBuffer source = new BoundedMediaBuffer(plan.getFragmentCount(), plan.getSlotBytes());
+        LiveClipHttpServer server = plannedServer(source, plan)) {
+      source.onInitialization(INIT);
+      server.start();
+      int total = Math.toIntExact(source.getContentLength());
+      try (Client client = request(server, "GET", "Range: bytes=" + (total - 31) + "-\r\n");
+          SyntheticProducer producer = new SyntheticProducer(source, plan.getFragmentCount(), plan.getSlotBytes(), 2, true)) {
+        headers(client, 206, 31);
+        client.expectWaiting();
+        producer.start();
+        byte[] expected = new byte[31];
+        for (int i = 0; i < expected.length; i++) expected[i] = fiveMinuteByte(total - 31 + i, plan.getSlotBytes());
+        equalBytes(expected, client.readFixed(31), "tail waits through300 progressing slots");
+        client.expectEof();
+        producer.awaitSuccess();
+        LiveClipHttpServer.TransferSnapshot done = awaitSnapshot(server, value -> value.responseComplete);
+        equal(31, done.bytesSent, "range count remains distinct from full source size");
+        equal(total, done.sourceBytesProduced, "future tail completed after the full source was produced");
+      }
+    }
+  }
+
+  private static void fiveMinuteStop() throws Exception {
+    LiveSessionPlan plan = LiveSessionPlan.FIVE_MINUTES;
+    try (BoundedMediaBuffer source = new BoundedMediaBuffer(plan.getFragmentCount(), plan.getSlotBytes());
+        LiveClipHttpServer server = plannedServer(source, plan)) {
+      source.onInitialization(INIT);
+      server.start();
+      long start = source.getContentLength() - 7;
+      try (Client client = request(server, "GET", "Range: bytes=" + start + "-\r\n")) {
+        headers(client, 206, 7);
+        client.expectWaiting();
+        long begun = System.nanoTime();
+        server.close();
+        check(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - begun) < 2500,
+            "660-second budget does not lengthen Stop or wait for unproduced tail");
+        client.expectEof();
+        LiveClipHttpServer.TransferSnapshot stopped = server.getTransferSnapshot();
+        check(!stopped.responseComplete && !stopped.payloadComplete, "canceled five-minute body is incomplete");
+        equal(0, stopped.activeGetCount, "cancel confirms workers stopped");
+        check(!source.isClosed(), "server cancellation does not own source cache");
+      }
+    }
+  }
+
   private static byte minuteByte(int offset, int slotBytes) {
     if (offset < INIT.length) return INIT[offset];
     int position = offset - INIT.length;
     return (byte) ((position % slotBytes) * 31 + position / slotBytes + 1);
+  }
+
+  /** Include the full slot index so positions beyond slot256 cannot alias earlier data. */
+  private static byte[] wideSlot(int size, int seed) {
+    byte[] result = bytes(size, seed);
+    for (int i = 0; i < 4; i++) result[i] = (byte) (seed >>> (24 - i * 8));
+    return result;
+  }
+
+  private static byte fiveMinuteByte(int offset, int slotBytes) {
+    if (offset < INIT.length) return INIT[offset];
+    int position = offset - INIT.length;
+    int withinSlot = position % slotBytes;
+    int seed = position / slotBytes + 1;
+    return withinSlot < 4 ? (byte) (seed >>> (24 - withinSlot * 8))
+        : (byte) (withinSlot * 31 + seed);
   }
 
   private static Client request(LiveClipHttpServer server, String method, String extraHeaders) throws Exception {
@@ -573,8 +712,13 @@ public final class LiveClipHttpServerTest {
   }
 
   private static LiveClipHttpServer minuteServer(BoundedMediaBuffer source) throws Exception {
+    return plannedServer(source, LiveSessionPlan.ONE_MINUTE);
+  }
+
+  private static LiveClipHttpServer plannedServer(BoundedMediaBuffer source, LiveSessionPlan plan)
+      throws Exception {
     return new LiveClipHttpServer(source, InetAddress.getByAddress(new byte[] {127, 0, 0, 1}),
-        LiveSessionPlan.ONE_MINUTE.getHttpResponseLimitMs(), event -> {});
+        plan.getHttpResponseLimitMs(), event -> {});
   }
 
   private static LiveClipHttpServer.TransferSnapshot awaitSnapshot(LiveClipHttpServer server,
@@ -603,12 +747,16 @@ public final class LiveClipHttpServerTest {
     private final AtomicReference<Throwable> failure = new AtomicReference<>();
     private final Thread thread;
     SyntheticProducer(BoundedMediaBuffer source, int slots, int slotBytes, long cadenceMs) {
+      this(source, slots, slotBytes, cadenceMs, false);
+    }
+    SyntheticProducer(BoundedMediaBuffer source, int slots, int slotBytes, long cadenceMs,
+        boolean wideSeeds) {
       thread = new Thread(() -> {
         try {
           for (int slot = 0; slot < slots && running.get(); slot++) {
             Thread.sleep(cadenceMs);
             if (!running.get()) return;
-            source.onFragment(bytes(slotBytes, slot + 1));
+            source.onFragment(wideSeeds ? wideSlot(slotBytes, slot + 1) : bytes(slotBytes, slot + 1));
           }
           if (running.get()) source.onComplete();
         } catch (Throwable problem) {

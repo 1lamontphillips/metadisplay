@@ -95,6 +95,7 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
   private var actualTransportReport = "No stream HTTP response observed."
   private var reportSessionPlan = LiveSessionPlan.SHORT
   private var reportTestTimeoutMs = TEST_TIMEOUT_MS
+  private var reportPlayerStateObservations = ""
   private var retainedCameraPacing: PhoneCameraProducer.PacingSnapshot? = null
   private var lastAppliedCameraView = ""
   private val reportStart = SystemClock.elapsedRealtime()
@@ -118,6 +119,9 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
     @Volatile var temporaryCleanupFailed = false
     var streamAssetBytes = 0L
     var firstPlayCaptured = false
+    val playerStateObservations = mutableMapOf<VideoPlayerState, Long>()
+    var observedPlaying = false
+    var idleAfterPlayingObservations = 0L
     var transferCaveatRecorded = false
     var session: DeviceSession? = null
     var display: Display? = null
@@ -354,6 +358,7 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
               "Finite experiment: ${run.plan.fragmentCount} slots, ${run.plan.slotBytes} bytes each; awaiting initialization."
               else "")
       firstPlaySnapshotReport = "No first SDK PLAYING snapshot captured."
+      reportPlayerStateObservations = ""
       retainedCameraPacing = null
       lastAppliedCameraView = ""
       configuredTransportReport = configuredTransport(mode, run.plan)
@@ -445,10 +450,14 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
       mode == TestMode.PADDED_CONTROL || isCameraMode(mode)
 
   private fun isCameraMode(mode: TestMode): Boolean =
-      mode == TestMode.LIVE_CAMERA || mode == TestMode.LIVE_CAMERA_60
+      mode == TestMode.LIVE_CAMERA || mode == TestMode.LIVE_CAMERA_60 ||
+          mode == TestMode.LIVE_CAMERA_300
 
-  private fun sessionPlanFor(mode: TestMode): LiveSessionPlan =
-      if (mode == TestMode.LIVE_CAMERA_60) LiveSessionPlan.ONE_MINUTE else LiveSessionPlan.SHORT
+  private fun sessionPlanFor(mode: TestMode): LiveSessionPlan = when (mode) {
+    TestMode.LIVE_CAMERA_300 -> LiveSessionPlan.FIVE_MINUTES
+    TestMode.LIVE_CAMERA_60 -> LiveSessionPlan.ONE_MINUTE
+    else -> LiveSessionPlan.SHORT
+  }
 
   private fun configuredTransport(mode: TestMode, plan: LiveSessionPlan): String = when (mode) {
     TestMode.REFERENCE -> "Public reference URL; remote protocol/framing is not measured"
@@ -460,7 +469,8 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
         "HTTP/1.0 CONNECTION_CLOSE; no Content-Length or Transfer-Encoding"
     TestMode.KNOWN_LENGTH_NO_RANGES ->
         "HTTP/1.1 CONTENT_LENGTH; finite exact length with ranges disabled"
-    TestMode.PADDED_CONTROL, TestMode.LIVE_CAMERA, TestMode.LIVE_CAMERA_60 ->
+    TestMode.PADDED_CONTROL, TestMode.LIVE_CAMERA, TestMode.LIVE_CAMERA_60,
+    TestMode.LIVE_CAMERA_300 ->
         "CONTENT_LENGTH; exact initialization plus ${plan.fragmentCount} fixed ${plan.slotBytes}-byte MP4 fragment slots; ranges supported; loopback only"
     else -> "HTTP/1.1 CONTENT_LENGTH; finite body ends at its declared length"
   }
@@ -915,6 +925,7 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
             else captureFirstPlaying(run)
           }
           if (cameraContext != null) recordCameraPlaybackContext(run, value, cameraContext)
+          retainPlayerStateObservation(run, value)
           record("Video state: ${value.name}")
           _state.value = _state.value.copy(playerState = value.name)
           when (value) {
@@ -973,6 +984,23 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
       val requestProtocol: String, val responseProtocol: String, val framing: String,
       val sourceBytesProduced: Long? = null,
   )
+
+  private fun retainPlayerStateObservation(run: TestRun, value: VideoPlayerState) {
+    if (!isCameraMode(run.mode)) return
+    fun increment(count: Long): Long = if (count < Long.MAX_VALUE) count + 1 else count
+    run.playerStateObservations[value] = increment(run.playerStateObservations[value] ?: 0L)
+    if (value == VideoPlayerState.IDLE && run.observedPlaying) {
+      run.idleAfterPlayingObservations = increment(run.idleAfterPlayingObservations)
+    }
+    if (value == VideoPlayerState.PLAYING) run.observedPlaying = true
+    val counts = VideoPlayerState.values().joinToString(", ") {
+      "${it.name}=${run.playerStateObservations[it] ?: 0L}"
+    }
+    reportPlayerStateObservations = "SDK camera state observations: $counts; " +
+        "IDLE_AFTER_FIRST_PLAYING=${run.idleAfterPlayingObservations}; lastState=${value.name}, " +
+        "lastObservedAtReportMs=${SystemClock.elapsedRealtime() - reportStart}. " +
+        "Counts include initial IDLE; they do not identify buffering or visible pauses."
+  }
 
   private data class CameraPlaybackContext(
       val transfer: TransferEvidence?,
@@ -1461,8 +1489,8 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
     val snapshot = _state.value
     val plan = reportSessionPlan
     return buildString {
-      appendLine("MetaDisplay bounded live camera experiment 0.7; SDK 1.0.1")
-      appendLine("LIVE_CAMERA and LIVE_CAMERA_60 use the phone rear camera only while this app is visible; controls use public fixtures.")
+      appendLine("MetaDisplay bounded live camera experiment 0.8; SDK 1.0.1")
+      appendLine("LIVE_CAMERA, LIVE_CAMERA_60 and LIVE_CAMERA_300 use the phone rear camera only while this app is visible; controls use public fixtures.")
       appendLine("Selected live/padded plan: ${plan.fragmentCount} finite fragments, nominalSeconds=${plan.nominalSeconds}; not indefinite streaming.")
       appendLine("Exact response budget: initialization plus ${plan.fragmentCount} valid ${plan.slotBytes}-byte fragment slots (slotPayloadBytes=${plan.slotPayloadBytes}); no estimated Content-Length.")
       appendLine("Session limits: testTimeoutMs=$reportTestTimeoutMs; boundedCaptureLimitMs=${plan.captureLimitMs}, boundedHttpResponseLimitMs=${plan.httpResponseLimitMs}.")
@@ -1476,6 +1504,7 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
       appendLine("Configured response: $configuredTransportReport")
       appendLine("Observed response: $actualTransportReport")
       appendLine("Player: ${snapshot.playerState}; error: ${snapshot.lastError ?: "none"}")
+      if (reportPlayerStateObservations.isNotEmpty()) appendLine(reportPlayerStateObservations)
       appendLine("Cleanup blocked: $cleanupBlocked")
       cleanupBlockReason?.let { appendLine("Cleanup block details: $it") }
       appendLine("Phone HTTP requests: ${snapshot.httpRequests}; bytes: ${snapshot.httpBytes}")

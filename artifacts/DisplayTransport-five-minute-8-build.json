@@ -1,0 +1,108 @@
+{
+  "application_id": "com.lamontphillips.metadisplay.transporttest",
+  "version_code": 8,
+  "version": "0.8-five-minute-camera",
+  "sdk": "1.0.1",
+  "media3_muxer": "1.11.1",
+  "apk_sha256": "3d92efb395388c2011cc1215f634f20feb6e665135d745cbd5b025300d40c427",
+  "zip_sha256": "7bf23b4b1c1d1ed81ddadc501bafa6c3d745ae78847d1b87d0dd1a4c5b90c7a7",
+  "zip_bytes": 23024300,
+  "signer_certificate_sha256": "36725d8bdd24d5072fda2f7cece96e87fccb9c59c46a78386a896b90cff7099e",
+  "session_plans": {
+    "SHORT": {
+      "fragments": 20,
+      "slot_bytes": 65536,
+      "capture_guard_ms": 35000,
+      "test_http_limit_ms": 75000
+    },
+    "ONE_MINUTE": {
+      "fragments": 60,
+      "slot_bytes": 65536,
+      "capture_guard_ms": 90000,
+      "test_http_limit_ms": 150000
+    },
+    "FIVE_MINUTES": {
+      "fragments": 300,
+      "slot_bytes": 65536,
+      "capture_guard_ms": 360000,
+      "test_http_limit_ms": 660000
+    }
+  },
+  "change": "Adds a single finite 300-fragment camera run with per-run limits. Keeps the one-minute and 20-second options. Retains fixed SDK state observation counts beyond the 240-event ring; counts do not identify buffering or visible pauses.",
+  "checks": {
+    "host_cases": {
+      "ClipHttpServer": 39,
+      "StreamProbeHttpServer": 60,
+      "FixedBudgetMedia": 60,
+      "LiveClipHttpServer": 42,
+      "CameraFramePacer": 29,
+      "CameraViewTransform": 36,
+      "LiveSessionPlan": 15,
+      "total": 281,
+      "failed": 0
+    },
+    "final_debug_build": "passed",
+    "lint": {
+      "errors": 0,
+      "warnings": 5
+    },
+    "apk_signature": "verified; same certificate as previous transport builds",
+    "permissions": "exact set matches0.7; CAMERA present, no microphone or external/media storage permissions",
+    "assets": "all three fixtures unchanged and match APK",
+    "unchanged_camera_format_pacing_geometry_container_source_sha256": {
+      "PhoneCameraProducer.kt": "2388085b0dc85d236a00b38c91a9d6df7785aca04788e3580d4f67358cc2d6ec",
+      "CameraFramePacer.java": "44c605b164a1c603051f3efd63a0fa17818aaa19e69d6d557e6e57f78dea9c25",
+      "CameraViewTransform.java": "a3a5fee99ab8c67d408c1bef4846ee7bb5890af6919468192965e68fcf6eb461",
+      "PhoneCameraEglRenderer.kt": "9a51ce9acdc81c68087a8a60f819c88f4b56632021f2cb0927bee6acbfb1c348",
+      "FixedBudgetMp4.java": "dce7ccefccbdfb86755a9c16b83efc02f6f5426772df6fd07cbd6ef6be9e6824",
+      "BoundedMediaBuffer.java": "f86d7c61d7ee00f2df62c2b0aa413927a5b64567867621d00144cf4897f70a03",
+      "LiveVideoConfig.java": "272fd0c2b188d807092e3c507ddc7d3d2480cf04aae74f7c9699cd2fb1a3228e"
+    },
+    "five_minute_media3_host_validation": {
+      "media3-original": {
+        "frames": 7200,
+        "encoded_packet_hashes_match_looped_public_fixture": true,
+        "decoded_frame_hashes_match_looped_public_fixture": true,
+        "rational_pts_dts_durations_match_continuous_24fps": true,
+        "duration_seconds": "300.000000",
+        "fragments": 300,
+        "size": 4733354,
+        "sha256": "acfb4b45901803c90bc30b684a96b65349f4a5ce330795dbb7b01cea1c9a673b",
+        "all_absolute_tfhd_offsets_match_actual_moof_positions": true
+      },
+      "media3-fixed": {
+        "frames": 7200,
+        "encoded_packet_hashes_match_looped_public_fixture": true,
+        "decoded_frame_hashes_match_looped_public_fixture": true,
+        "rational_pts_dts_durations_match_continuous_24fps": true,
+        "duration_seconds": "300.000000",
+        "fragments": 300,
+        "size": 19661489,
+        "sha256": "dbbf1ef5c3e1a6b2c914629f93fafeac269f71d9dd7d199225d2b95efbd4a822",
+        "all_absolute_tfhd_offsets_match_actual_moof_positions": true,
+        "initialization_bytes": 689,
+        "exact_slot_bytes": 65536,
+        "three_hundred_exact_slots": true,
+        "valid_top_level_free_padding": true,
+        "completed_eof_verified": true,
+        "extra_cache_fragment_rejected": true,
+        "post_quota_muxer_output_cannot_expand_response": true,
+        "three_hundredth_slot_emitted_before_muxer_close": true
+      },
+      "limits": "Host simulation uses only the public fixture and the published Media3 classes with test-only Android framework shims. It does not establish real Android camera or Meta glasses five-minute playback or latency."
+    },
+    "five_minute_media_tested_source_sha256": {
+      "FixedBudgetMp4.java": "dce7ccefccbdfb86755a9c16b83efc02f6f5426772df6fd07cbd6ef6be9e6824",
+      "BoundedMediaBuffer.java": "f86d7c61d7ee00f2df62c2b0aa413927a5b64567867621d00144cf4897f70a03"
+    },
+    "independent_review": "clear; all camera mode routes, selected quotas/deadlines, exact length, retained reports/state counts, privacy/lifecycle/Stop and shorter baselines audited",
+    "change_source_sha256": {
+      "LiveSessionPlan.java": "7f91e77744c47405e62ee3b52840718fb0c24bd4c5dc3262c74faed82f0fbcbd",
+      "LiveClipHttpServer.java": "349df0ca9232aaebf24312bbe64c55908492ab71702c102922469f3bdc225a6e",
+      "TransportState.kt": "74e880895282bc1eeb8a7b75e3baac359e5f350f9f2448c1e9efd4fe8faca49a",
+      "TransportViewModel.kt": "a3c238f3fd560cde55590521fa3b3cb22fcabfa547b8437db0633f29e47cea0f",
+      "MainActivity.kt": "140dfa405a4df4a8f98f59be40ccb919ce5fc928a763df725932bd13e3168ac3"
+    }
+  },
+  "limits": "User confirmed0.7 one-minute view smooth/readable with about2s acceptable observed delay. Physical0.8 five-minute playback remains unverified. Media host simulation uses public AVC samples with continuous timestamps, not actual camera capture. Runs remain finite."
+}

@@ -6,6 +6,8 @@ public final class LiveSessionPlan {
       20, LiveVideoConfig.SLOT_BYTES, 35000, 75000, 75000);
   public static final LiveSessionPlan ONE_MINUTE = new LiveSessionPlan(
       60, LiveVideoConfig.SLOT_BYTES, 90000, 150000, 150000);
+  public static final LiveSessionPlan FIVE_MINUTES = new LiveSessionPlan(
+      300, LiveVideoConfig.SLOT_BYTES, 360000, 660000, 660000);
 
   private final int fragmentCount;
   private final int slotBytes;

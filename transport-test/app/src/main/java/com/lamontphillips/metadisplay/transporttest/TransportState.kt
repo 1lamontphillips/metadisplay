@@ -16,6 +16,7 @@ enum class TestMode {
   PADDED_CONTROL,
   LIVE_CAMERA,
   LIVE_CAMERA_60,
+  LIVE_CAMERA_300,
 }
 
 data class TransportState(

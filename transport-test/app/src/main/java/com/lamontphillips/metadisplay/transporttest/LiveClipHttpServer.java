@@ -35,7 +35,7 @@ public final class LiveClipHttpServer implements AutoCloseable {
   private static final int WORKER_COUNT = 4;
   private static final int QUEUE_SIZE = 8;
   private static final long DEFAULT_RESPONSE_LIMIT_MS = 75000;
-  private static final long MAX_RESPONSE_LIMIT_MS = 180000;
+  private static final long MAX_RESPONSE_LIMIT_MS = 900000;
 
   public enum Phase { STARTED, PROGRESS, COMPLETE }
 

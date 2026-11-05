@@ -1,6 +1,6 @@
 # Display Access Android sample
 
-The latest experiment is [Display Transport Test: one-minute camera 7](./DisplayTransport-one-minute-7.zip). Version 0.6 was confirmed smooth and readable; this adds a continuous 60-fragment run while preserving the 20-fragment camera/control baselines. The longer run needs device validation. See its [phone instructions](./DisplayTransport-one-minute-7-INSTALL.md). It updates the separate test app and keeps Display Access installed.
+The latest experiment is [Display Transport Test: five-minute camera 8](./DisplayTransport-five-minute-8.zip). The user confirmed a smooth, readable one-minute run in version 0.7 with about two seconds of acceptable delay. This adds a continuous 300-fragment run while preserving the one-minute and 20-fragment baselines. The five-minute run needs device validation. See its [phone instructions](./DisplayTransport-five-minute-8-INSTALL.md). It updates the separate test app and keeps Display Access installed.
 
 ## Diagnostic update
 

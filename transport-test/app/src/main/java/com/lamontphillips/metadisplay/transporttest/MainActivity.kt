@@ -154,7 +154,7 @@ private fun TransportScreen(
           fontWeight = FontWeight.Bold)
       Text("Live camera sessions", style = MaterialTheme.typography.titleMedium)
       Text(
-          "Choose a one-minute camera session or a quick 20-second check. Keep this app open. Your rotation and framing choices are remembered.",
+          "Choose a five-minute camera session or a shorter check. Keep this app open. Your rotation and framing choices are remembered.",
           style = MaterialTheme.typography.bodyLarge,
       )
       Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
@@ -179,9 +179,20 @@ private fun TransportScreen(
         }
       }
       SourceCard(
-          title = "1 · One-minute live camera",
+          title = "1 · Five-minute live camera",
           description = if (cameraPermissionGranted) {
-            "Use the rear camera continuously for 60 video fragments, about one minute. Keep the glasses on and this app open until the session finishes."
+            "Use the rear camera continuously for about five minutes. Keep the glasses on and this app open until the session finishes. Silent video; no recording file is saved."
+          } else {
+            "Allow Camera access, then tap Start five-minute camera. Capture stops when the session ends, you tap Stop, or this app leaves the foreground."
+          },
+          button = if (cameraPermissionGranted) "Start five-minute camera" else "Allow camera for five-minute test",
+          enabled = state.canStart && !state.busy,
+          onClick = { if (cameraPermissionGranted) onStart(TestMode.LIVE_CAMERA_300) else onCameraPermission() },
+      )
+      SourceCard(
+          title = "2 · One-minute live camera",
+          description = if (cameraPermissionGranted) {
+            "Repeat the one-minute live view. Keep the glasses on and this app open until the session finishes."
           } else {
             "Allow Camera access, then tap Start one-minute camera. Capture stops when the session ends, you tap Stop, or this app leaves the foreground."
           },
@@ -190,7 +201,7 @@ private fun TransportScreen(
           onClick = { if (cameraPermissionGranted) onStart(TestMode.LIVE_CAMERA_60) else onCameraPermission() },
       )
       SourceCard(
-          title = "2 · Quick live check",
+          title = "3 · Quick live check",
           description = if (cameraPermissionGranted) {
             "Point the rear camera at a clock or moving object. Start the test and check your glasses. Silent video; no recording file is saved."
           } else {

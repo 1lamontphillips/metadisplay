@@ -2,13 +2,15 @@
 
 Android prototypes for a smooth, continuous phone-camera view in Meta Ray-Ban Display glasses.
 
-The user confirmed version 0.6 gives a good, smooth live phone-camera view in physical glasses, with about two seconds of observed delay. Version 0.7 adds a one-minute camera option while retaining the working 20-second baseline. The longer session still needs device validation.
+The user confirmed version 0.7 gives a good, smooth live phone-camera view throughout a one-minute run in physical glasses, with about two seconds of acceptable observed delay. Version 0.8 adds a five-minute option while retaining the working shorter tests. The five-minute run still needs device validation.
 
 ## Current transport experiment
 
-[Download one-minute camera 7](artifacts/DisplayTransport-one-minute-7.zip) · [Phone instructions](artifacts/DisplayTransport-one-minute-7-INSTALL.md) · [Source and build](transport-test/README.md)
+[Download five-minute camera 8](artifacts/DisplayTransport-five-minute-8.zip) · [Phone instructions](artifacts/DisplayTransport-five-minute-8-INSTALL.md) · [Source and build](transport-test/README.md)
 
-This updates the separate Display Transport Test app. **Start one-minute camera** uses one continuous encoder/session and an exact 60-fragment byte budget. The 20-fragment quick camera test and public-fixture controls retain their original budgets. Anchored 24-Hz pacing and the saved live rotation/framing controls are unchanged. Capture is explicit and foreground-only, saves no recording file, and ends at its selected finite limit.
+This updates the separate Display Transport Test app. **Start five-minute camera** uses one continuous encoder/session and an exact 300-fragment byte budget. The one-minute option, 20-fragment quick camera test and public-fixture controls retain their original budgets. Anchored 24-Hz pacing and the saved live rotation/framing controls are unchanged. Capture is explicit and foreground-only, saves no recording file, and ends at its selected finite limit.
+
+[One-minute camera 7](artifacts/DisplayTransport-one-minute-7.zip) remains the user-confirmed one-minute baseline.
 
 [Transport Test 1](artifacts/DisplayTransport-test-1.zip) remains available as the validated finite-file baseline.
 

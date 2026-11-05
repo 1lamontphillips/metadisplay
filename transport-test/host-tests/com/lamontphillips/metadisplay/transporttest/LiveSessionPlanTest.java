@@ -22,6 +22,11 @@ public final class LiveSessionPlanTest {
     cases.add(new NamedCase("sixty-slot cache retains exact bytes and true EOF", LiveSessionPlanTest::minuteExactBody));
     cases.add(new NamedCase("one-minute completion requires all sixty slots", LiveSessionPlanTest::minuteCompletion));
     cases.add(new NamedCase("original32MiB slot-budget limit remains enforced", LiveSessionPlanTest::originalBudgetBound));
+    cases.add(new NamedCase("five-minute plan fits existing memory and playback bounds", LiveSessionPlanTest::fiveMinuteBounds));
+    cases.add(new NamedCase("five-minute quota rejects shorter and differently sized caches", LiveSessionPlanTest::fiveMinuteMismatch));
+    cases.add(new NamedCase("300-slot cache has exact bytes and true EOF", LiveSessionPlanTest::fiveMinuteExactBody));
+    cases.add(new NamedCase("five-minute completion requires all300 slots", LiveSessionPlanTest::fiveMinuteCompletion));
+    cases.add(new NamedCase("five-minute quota metadata remains after memory cleanup", LiveSessionPlanTest::fiveMinuteCleanup));
     int failures = 0;
     for (NamedCase test : cases) {
       try {
@@ -88,7 +93,8 @@ public final class LiveSessionPlanTest {
   }
 
   private static void matchingBuffers() throws Exception {
-    for (LiveSessionPlan plan : new LiveSessionPlan[] {LiveSessionPlan.SHORT, LiveSessionPlan.ONE_MINUTE}) {
+    for (LiveSessionPlan plan : new LiveSessionPlan[] {
+        LiveSessionPlan.SHORT, LiveSessionPlan.ONE_MINUTE, LiveSessionPlan.FIVE_MINUTES}) {
       try (BoundedMediaBuffer source = new BoundedMediaBuffer(plan.getFragmentCount(), plan.getSlotBytes())) {
         plan.validateBuffer(source);
         source.onInitialization(bytes(17, 2));
@@ -176,9 +182,119 @@ public final class LiveSessionPlanTest {
     }
   }
 
+  private static void fiveMinuteBounds() throws Exception {
+    LiveSessionPlan plan = LiveSessionPlan.FIVE_MINUTES;
+    equal(300, plan.getFragmentCount(), "five-minute continuous fragment budget");
+    equal(300, plan.getNominalSeconds(), "nominal300-second session");
+    equal(65536, plan.getSlotBytes(), "same proven fragment format");
+    equal(19660800, plan.getSlotPayloadBytes(), "300 exact slots without bitrate estimation");
+    check(plan.getSlotPayloadBytes() <= 32L * 1024 * 1024, "existing slot-memory cap preserved");
+    check(plan.getSlotPayloadBytes() + FixedBudgetMp4.MAX_INITIALIZATION_BYTES <= Integer.MAX_VALUE,
+        "largest allowed initialization plus five-minute budget fits indexed cache");
+    equal(360000, plan.getCaptureLimitMs(), "finite capture guard beyond nominal duration");
+    equal(660000, plan.getTestTimeoutMs(), "finite delayed playback limit");
+    equal(660000, plan.getHttpResponseLimitMs(), "finite full-response limit");
+    check(plan.getCaptureLimitMs() >= plan.getNominalSeconds() * 1000L,
+        "camera can produce entire nominal session");
+    check(plan.getCaptureLimitMs() < plan.getTestTimeoutMs(), "playback can finish after camera stops");
+    check(plan.getTestTimeoutMs() >= 2L * plan.getNominalSeconds() * 1000,
+        "overall limit allows finite full-production buffering plus playback");
+  }
+
+  private static void fiveMinuteMismatch() throws Exception {
+    for (int count : new int[] {20, 60, 299, 301}) {
+      try (BoundedMediaBuffer source = new BoundedMediaBuffer(count, 65536)) {
+        rejects(() -> LiveSessionPlan.FIVE_MINUTES.validateBuffer(source));
+        equal(0, source.getProducedBytes(), "quota mismatch rejected before media output");
+      }
+    }
+    try (BoundedMediaBuffer source = new BoundedMediaBuffer(300, 32768)) {
+      rejects(() -> LiveSessionPlan.FIVE_MINUTES.validateBuffer(source));
+      equal(0, source.getContentLength(), "slot-size mismatch has no declared response");
+    }
+    try (BoundedMediaBuffer source = new BoundedMediaBuffer(300, 65536)) {
+      rejects(() -> LiveSessionPlan.SHORT.validateBuffer(source));
+      rejects(() -> LiveSessionPlan.ONE_MINUTE.validateBuffer(source));
+    }
+  }
+
+  private static void fiveMinuteExactBody() throws Exception {
+    LiveSessionPlan plan = LiveSessionPlan.FIVE_MINUTES;
+    byte[] init = bytes(703, 11);
+    MessageDigest expected = MessageDigest.getInstance("SHA-256");
+    MessageDigest actual = MessageDigest.getInstance("SHA-256");
+    try (BoundedMediaBuffer source = new BoundedMediaBuffer(plan.getFragmentCount(), plan.getSlotBytes())) {
+      plan.validateBuffer(source);
+      source.onInitialization(init);
+      equal(19661503, source.getContentLength(), "actual initialization plus300slots");
+      expected.update(init);
+      for (int i = 0; i < plan.getFragmentCount(); i++) {
+        byte[] slot = wideSlot(plan.getSlotBytes(), i + 1);
+        expected.update(slot);
+        source.onFragment(slot);
+      }
+      source.onComplete();
+      byte[] chunk = new byte[16384];
+      long offset = 0;
+      int amount;
+      while ((amount = source.readAt(offset, chunk, 0, chunk.length, 0)) >= 0) {
+        check(amount > 0, "reader advances until true response end");
+        actual.update(chunk, 0, amount);
+        offset += amount;
+      }
+      check(Arrays.equals(expected.digest(), actual.digest()), "all300 produced slots retain exact hashes");
+      equal(source.getContentLength(), offset, "true EOF exactly matches Content-Length");
+      equal(300, source.getCompletedSlots(), "five-minute quota complete");
+      check(source.isComplete(), "completed source distinct from intermediate production");
+      try {
+        source.onFragment(new byte[plan.getSlotBytes()]);
+        throw new AssertionError("slot301 exceeded the declared response");
+      } catch (IOException expectedOverflow) { }
+      equal(offset, source.getProducedBytes(), "overflow cannot increase the honest response size");
+    }
+  }
+
+  private static void fiveMinuteCompletion() throws Exception {
+    LiveSessionPlan plan = LiveSessionPlan.FIVE_MINUTES;
+    try (BoundedMediaBuffer source = new BoundedMediaBuffer(plan.getFragmentCount(), plan.getSlotBytes())) {
+      source.onInitialization(bytes(7, 4));
+      byte[] slot = new byte[plan.getSlotBytes()];
+      for (int i = 0; i < 299; i++) source.onFragment(slot);
+      try {
+        source.onComplete();
+        throw new AssertionError("299 slots falsely completed a300-slot response");
+      } catch (IOException expected) { }
+      check(!source.isComplete(), "unproduced final fragment remains incomplete");
+      source.onFragment(slot);
+      source.onComplete();
+      check(source.isComplete(), "final promised fragment completes the response");
+    }
+  }
+
+  private static void fiveMinuteCleanup() throws Exception {
+    LiveSessionPlan plan = LiveSessionPlan.FIVE_MINUTES;
+    BoundedMediaBuffer source = new BoundedMediaBuffer(plan.getFragmentCount(), plan.getSlotBytes());
+    source.onInitialization(bytes(703, 2));
+    source.onFragment(bytes(plan.getSlotBytes(), 3));
+    source.close();
+    check(source.isClosed(), "large cache closed");
+    equal(300, source.getSlotCount(), "immutable large quota survives cleanup");
+    equal(65536, source.getSlotBytes(), "slot metadata survives cleanup");
+    equal(19661503, source.getContentLength(), "declared length remains diagnostic metadata");
+    try {
+      source.readAt(0, new byte[1], 0, 1, 0);
+      throw new AssertionError("closed five-minute camera cache remained readable");
+    } catch (IOException expected) { }
+  }
+
   private static byte[] bytes(int size, int seed) {
     byte[] result = new byte[size];
     for (int i = 0; i < size; i++) result[i] = (byte) (i * 19 + seed);
+    return result;
+  }
+  private static byte[] wideSlot(int size, int seed) {
+    byte[] result = bytes(size, seed);
+    for (int i = 0; i < 4; i++) result[i] = (byte) (seed >>> (24 - i * 8));
     return result;
   }
   private static void rejects(Case body) throws Exception {
