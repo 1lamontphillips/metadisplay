@@ -38,7 +38,10 @@ public final class StreamProbeHttpServer implements AutoCloseable {
   private static final int WORKER_COUNT = 4;
   private static final int QUEUE_SIZE = 8;
 
-  public enum Delivery { FILE, PACED_FILE, PACED_CHUNKED }
+  public enum Delivery {
+    FILE, PACED_FILE, PACED_CHUNKED, CHUNKED_FILE,
+    CLOSE_FILE, PACED_CLOSE, PACED_CLOSE_HTTP10
+  }
   public enum Phase { STARTED, PROGRESS, COMPLETE }
 
   /** Safe protocol summary. start/end are inclusive asset offsets, or -1 when absent. */
@@ -52,6 +55,10 @@ public final class StreamProbeHttpServer implements AutoCloseable {
     public final boolean assetRequest;
     public final long transferId;
     public final Phase phase;
+    public final boolean rangeRequested;
+    public final String requestProtocol;
+    public final String responseProtocol;
+    public final String framing;
 
     private Event(Request request, Phase phase) {
       method = request.method;
@@ -63,6 +70,10 @@ public final class StreamProbeHttpServer implements AutoCloseable {
       assetRequest = request.assetRequest;
       transferId = request.transferId;
       this.phase = phase;
+      rangeRequested = request.rangeRequested;
+      requestProtocol = request.requestProtocol;
+      responseProtocol = request.responseProtocol;
+      framing = request.framing;
     }
   }
 
@@ -80,11 +91,14 @@ public final class StreamProbeHttpServer implements AutoCloseable {
     public final int status;
     public final boolean rangeRequested;
     public final boolean writeInProgress;
+    public final String requestProtocol;
+    public final String responseProtocol;
+    public final String framing;
 
     private TransferSnapshot(long id, long bytesSent, long plannedBytes,
         boolean responseComplete, boolean payloadComplete, int activeGetCount,
         long totalGetCount, long start, long end, int status, boolean rangeRequested,
-        boolean writeInProgress) {
+        boolean writeInProgress, String requestProtocol, String responseProtocol, String framing) {
       this.id = id;
       this.bytesSent = bytesSent;
       this.plannedBytes = plannedBytes;
@@ -97,6 +111,9 @@ public final class StreamProbeHttpServer implements AutoCloseable {
       this.status = status;
       this.rangeRequested = rangeRequested;
       this.writeInProgress = writeInProgress;
+      this.requestProtocol = requestProtocol;
+      this.responseProtocol = responseProtocol;
+      this.framing = framing;
     }
   }
 
@@ -110,7 +127,7 @@ public final class StreamProbeHttpServer implements AutoCloseable {
   private long totalGetCount;
   private int activeGetCount;
   private TransferSnapshot latestTransfer = new TransferSnapshot(
-      0, 0, 0, false, false, 0, 0, -1, -1, 0, false, false);
+      0, 0, 0, false, false, 0, 0, -1, -1, 0, false, false, "UNKNOWN", "UNKNOWN", "UNKNOWN");
   private final Consumer<Event> listener;
   private final String path;
   private final Object lifecycle = new Object();
@@ -242,6 +259,35 @@ public final class StreamProbeHttpServer implements AutoCloseable {
     }
   }
 
+  private boolean isUnknownLength() {
+    return delivery != Delivery.FILE && delivery != Delivery.PACED_FILE;
+  }
+
+  private boolean isPaced() {
+    return delivery == Delivery.PACED_FILE || delivery == Delivery.PACED_CHUNKED
+        || delivery == Delivery.PACED_CLOSE || delivery == Delivery.PACED_CLOSE_HTTP10;
+  }
+
+  private void selectResponseFraming(Request request) {
+    boolean chunkedMode = delivery == Delivery.PACED_CHUNKED || delivery == Delivery.CHUNKED_FILE;
+    boolean http10 = "HTTP/1.0".equals(request.requestProtocol);
+    request.http10Fallback = chunkedMode && http10;
+    request.responseProtocol = http10 || delivery == Delivery.PACED_CLOSE_HTTP10
+        ? "HTTP/1.0" : "HTTP/1.1";
+    request.framing = !isUnknownLength() ? "CONTENT_LENGTH"
+        : chunkedMode && !http10 ? "CHUNKED" : "CONNECTION_CLOSE";
+  }
+
+  private static String transferOutcome(Request request, String ordinary) {
+    if (request.http10Fallback) {
+      return "served".equals(ordinary) ? "served_http10_fallback" : "http10_fallback";
+    }
+    if (request.rangeIgnored) {
+      return "served".equals(ordinary) ? "served_range_ignored" : "range_ignored";
+    }
+    return ordinary;
+  }
+
   private void serve(Socket connection) {
     Request request = new Request();
     try {
@@ -250,6 +296,7 @@ public final class StreamProbeHttpServer implements AutoCloseable {
       String requestLine = readLine(input, connection, deadline, MAX_REQUEST_LINE, 414,
           "request_line_too_long");
       parseRequestLine(requestLine, request);
+      selectResponseFraming(request);
       String range = readHeaders(input, connection, deadline);
       if (!path.equals(request.target)) throw new HttpProblem(404, "not_found");
       if (!"GET".equals(request.method) && !"HEAD".equals(request.method)) {
@@ -258,20 +305,21 @@ public final class StreamProbeHttpServer implements AutoCloseable {
       request.assetRequest = true;
       request.rangeRequested = range != null;
       requestCount.incrementAndGet();
-      boolean chunked = delivery == Delivery.PACED_CHUNKED;
-      request.rangeIgnored = chunked && range != null;
-      long[] selected = selectRange(chunked ? null : range);
+      boolean unknownLength = isUnknownLength();
+      boolean chunked = "CHUNKED".equals(request.framing);
+      request.rangeIgnored = unknownLength && range != null;
+      long[] selected = selectRange(unknownLength ? null : range);
       request.start = selected[0];
       request.end = selected[1];
-      request.status = chunked || range == null ? 200 : 206;
+      request.status = unknownLength || range == null ? 200 : 206;
       request.plannedBytes = request.end < request.start ? 0 : request.end - request.start + 1;
       if ("GET".equals(request.method)) {
         beginTransfer(request);
-        request.outcome = request.rangeIgnored ? "range_ignored" : "started";
+        request.outcome = transferOutcome(request, "started");
         emit(request, Phase.STARTED);
       }
       OutputStream output = connection.getOutputStream();
-      writeHeaders(output, request.status, request.plannedBytes, request.start, request.end);
+      writeHeaders(output, request, request.plannedBytes);
       if ("GET".equals(request.method)) {
         sendPayload(output, request, chunked);
         request.payloadComplete = true;
@@ -282,10 +330,14 @@ public final class StreamProbeHttpServer implements AutoCloseable {
         ensureServing();
         if (chunked) output.write("0\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
         output.flush();
+        if ("CONNECTION_CLOSE".equals(request.framing)) {
+          // EOF is the response delimiter. Do not mark completion at payload/flush time.
+          connection.shutdownOutput();
+        }
         request.responseComplete = true;
         updateTransfer(request, false);
       }
-      request.outcome = request.rangeIgnored ? "served_range_ignored" : "served";
+      request.outcome = transferOutcome(request, "served");
     } catch (HttpProblem invalid) {
       request.status = invalid.status;
       request.outcome = invalid.outcome;
@@ -323,7 +375,8 @@ public final class StreamProbeHttpServer implements AutoCloseable {
   private TransferSnapshot snapshot(Request request) {
     return new TransferSnapshot(request.transferId, request.bytesSent, request.plannedBytes,
         request.responseComplete, request.payloadComplete, activeGetCount, totalGetCount,
-        request.start, request.end, request.status, request.rangeRequested, request.writeInProgress);
+        request.start, request.end, request.status, request.rangeRequested, request.writeInProgress,
+        request.requestProtocol, request.responseProtocol, request.framing);
   }
 
   private void updateTransfer(Request request, boolean finished) {
@@ -339,7 +392,8 @@ public final class StreamProbeHttpServer implements AutoCloseable {
         TransferSnapshot latest = latestTransfer;
         latestTransfer = new TransferSnapshot(latest.id, latest.bytesSent, latest.plannedBytes,
             latest.responseComplete, latest.payloadComplete, activeGetCount, totalGetCount,
-            latest.start, latest.end, latest.status, latest.rangeRequested, latest.writeInProgress);
+            latest.start, latest.end, latest.status, latest.rangeRequested, latest.writeInProgress,
+            latest.requestProtocol, latest.responseProtocol, latest.framing);
       }
     }
   }
@@ -348,11 +402,12 @@ public final class StreamProbeHttpServer implements AutoCloseable {
       throws IOException, InterruptedException {
     int offset = (int) request.start;
     int remaining = (int) request.plannedBytes;
-    long durationMs = delivery == Delivery.FILE || content.length == 0 ? 0 :
+    long durationMs = !isPaced() || content.length == 0 ? 0 :
         pacingDurationMs * request.plannedBytes / content.length;
     long started = System.nanoTime();
     // A small initial write exposes headers/init bytes without deliberately sending the full clip.
-    int initial = durationMs > 0 && remaining > 1 ?
+    int initial = (durationMs > 0 || delivery == Delivery.CHUNKED_FILE ||
+        delivery == Delivery.CLOSE_FILE) && remaining > 1 ?
         Math.min(4096, Math.max(1, remaining / 32)) : Math.min(16384, remaining);
     if (initial > 0) {
       writeBodyChunk(output, request, offset, initial, chunked);
@@ -398,7 +453,7 @@ public final class StreamProbeHttpServer implements AutoCloseable {
     long now = System.nanoTime();
     if (force || now - request.lastProgress >= TimeUnit.SECONDS.toNanos(1)) {
       request.lastProgress = now;
-      request.outcome = request.rangeIgnored ? "range_ignored" : "progress";
+      request.outcome = transferOutcome(request, "progress");
       emit(request, Phase.PROGRESS);
     }
   }
@@ -431,6 +486,7 @@ public final class StreamProbeHttpServer implements AutoCloseable {
     if (!"HTTP/1.0".equals(version) && !"HTTP/1.1".equals(version)) {
       throw new HttpProblem(400, "malformed_request");
     }
+    request.requestProtocol = version;
     request.target = line.substring(first + 1, second);
     // Exact comparison below rejects traversal, query strings, encoded paths and absolute URLs.
   }
@@ -549,14 +605,16 @@ public final class StreamProbeHttpServer implements AutoCloseable {
 
   private void sendError(Socket socket, Request request) {
     try {
-      writeHeaders(socket.getOutputStream(), request.status, 0, -1, -1);
+      writeHeaders(socket.getOutputStream(), request, 0);
     } catch (IOException ignored) {
       // Preserve the safe protocol diagnosis if the peer has already disconnected.
     }
   }
 
-  private void writeHeaders(OutputStream output, int status, long length, long start, long end)
-      throws IOException {
+  private void writeHeaders(OutputStream output, Request request, long length) throws IOException {
+    int status = request.status;
+    // Error responses always have a known, empty body regardless of the configured mode.
+    if (status != 200 && status != 206) request.framing = "CONTENT_LENGTH";
     String reason;
     switch (status) {
       case 200: reason = "OK"; break;
@@ -569,11 +627,14 @@ public final class StreamProbeHttpServer implements AutoCloseable {
       case 431: reason = "Request Header Fields Too Large"; break;
       default: reason = "Bad Request";
     }
-    StringBuilder headers = new StringBuilder("HTTP/1.1 ").append(status).append(' ')
+    StringBuilder headers = new StringBuilder(request.responseProtocol).append(' ')
+        .append(status).append(' ')
         .append(reason).append("\r\nConnection: close\r\nCache-Control: no-store\r\n")
         .append("X-Content-Type-Options: nosniff\r\n");
-    if (delivery == Delivery.PACED_CHUNKED && status == 200) {
+    if ("CHUNKED".equals(request.framing)) {
       headers.append("Transfer-Encoding: chunked\r\nAccept-Ranges: none\r\n");
+    } else if ("CONNECTION_CLOSE".equals(request.framing)) {
+      headers.append("Accept-Ranges: none\r\n");
     } else {
       headers.append("Content-Length: ").append(length).append("\r\n");
       if (status == 200 || status == 206 || status == 416) {
@@ -584,7 +645,7 @@ public final class StreamProbeHttpServer implements AutoCloseable {
       headers.append("Content-Type: video/mp4\r\n");
     }
     if (status == 206) {
-      headers.append("Content-Range: bytes ").append(start).append('-').append(end)
+      headers.append("Content-Range: bytes ").append(request.start).append('-').append(request.end)
           .append('/').append(content.length).append("\r\n");
     } else if (status == 416) {
       headers.append("Content-Range: bytes */").append(content.length).append("\r\n");
@@ -662,6 +723,10 @@ public final class StreamProbeHttpServer implements AutoCloseable {
     boolean rangeRequested;
     boolean rangeIgnored;
     boolean writeInProgress;
+    boolean http10Fallback;
+    String requestProtocol = "UNKNOWN";
+    String responseProtocol = "HTTP/1.1";
+    String framing = "CONTENT_LENGTH";
     long start = -1;
     long end = -1;
     String outcome = "client_disconnected";

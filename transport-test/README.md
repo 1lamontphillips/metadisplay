@@ -1,10 +1,12 @@
 # Display Transport Test
 
-A side-by-side Android test app for checking phone-hosted MP4 playback in Meta Ray-Ban Display glasses. Finite phone-local playback has been confirmed on the user's glasses. Version 0.2 tests progressive delivery as the next prerequisite for smooth phone-camera video; it does not access the camera.
+A side-by-side Android test app for checking phone-hosted MP4 playback in Meta Ray-Ban Display glasses. Smooth progressive playback of a known-length fragmented MP4 has been confirmed on the user's glasses. Version 0.3 compares unknown-length delivery methods as the next prerequisite for smooth phone-camera video; it does not access the camera.
 
 This test has a distinct application ID and installs alongside Display Access. It uses Meta's documented Developer Mode values of `0` and needs its own app registration.
 
-Version 0.2 compares a 20-second silent MP4 control, the same encoded pictures remuxed into fragmented MP4, paced known-length delivery, and paced chunked unknown-length delivery. The report records an immutable transfer snapshot at first SDK PLAYING and retains uncertainty for incomplete/ranged/concurrent measurements. See [the device test guide](../artifacts/DisplayTransport-stream-check-2-INSTALL.md).
+Version 0.3 compares paced close-delimited HTTP/1.1 and HTTP/1.0 responses, plus an immediately delivered chunked control. All use the same finite 20-second silent fragmented MP4. The report records actual request/response protocols and framing, plus an immutable transfer snapshot at first SDK PLAYING. It retains uncertainty for incomplete/ranged/concurrent measurements. Chunked delivery falls back to connection-close framing for HTTP/1.0 requesters. See [the device test guide](../artifacts/DisplayTransport-delivery-check-3-INSTALL.md).
+
+Version 0.2's ordinary MP4, fragmented MP4, paced known-length and paced chunked modes remain under **Show earlier transport tests**, along with an immediate close-delimited control. The known-length gradual test worked; the paced chunked test failed before PLAYING. Request HTTP versions were not captured by 0.2, so that report cannot determine whether HTTP/1.0 chunked incompatibility was involved.
 
 The earlier transport tests remain available under **Show earlier transport tests** and use the same public sample clip:
 

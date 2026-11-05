@@ -83,6 +83,8 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
   private var activeRun: TestRun? = null
   private var reportDeviceStatus = "No glasses found"
   private var firstPlaySnapshotReport = "No first SDK PLAYING snapshot captured."
+  private var configuredTransportReport = "No test configured."
+  private var actualTransportReport = "No stream HTTP response observed."
   private val reportStart = SystemClock.elapsedRealtime()
   private val connectivity = app.getSystemService(ConnectivityManager::class.java)
 
@@ -264,7 +266,10 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
           streamEvidence = if (isStreamMode(mode)) "Awaiting first SDK PLAYING snapshot."
               else "File control; no stream transfer snapshot.")
       firstPlaySnapshotReport = "No first SDK PLAYING snapshot captured."
+      configuredTransportReport = configuredTransport(mode)
+      actualTransportReport = "No stream HTTP response observed."
       record("Test ${run.number}: ${mode.name}; finite MP4 only")
+      record("Configured response: $configuredTransportReport")
       val timeoutMs = if (isExtendedMode(mode)) STREAM_TEST_TIMEOUT_MS else TEST_TIMEOUT_MS
       run.scope.launch {
         delay(timeoutMs)
@@ -329,12 +334,31 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
   }
 
   private fun isStreamMode(mode: TestMode): Boolean = when (mode) {
-    TestMode.FRAGMENTED_FILE, TestMode.PACED_FILE, TestMode.PACED_CHUNKED -> true
+    TestMode.FRAGMENTED_FILE, TestMode.PACED_FILE, TestMode.PACED_CHUNKED,
+    TestMode.CHUNKED_FILE, TestMode.CLOSE_FILE, TestMode.PACED_CLOSE,
+    TestMode.PACED_CLOSE_HTTP10 -> true
     else -> false
   }
 
   private fun isExtendedMode(mode: TestMode): Boolean =
       mode == TestMode.STREAM_CONTROL || isStreamMode(mode)
+
+  private fun configuredTransport(mode: TestMode): String = when (mode) {
+    TestMode.REFERENCE -> "Public reference URL; remote protocol/framing is not measured"
+    TestMode.CHUNKED_FILE, TestMode.PACED_CHUNKED ->
+        "HTTP/1.1 CHUNKED; HTTP/1.0 requests fall back to HTTP/1.0 CONNECTION_CLOSE"
+    TestMode.CLOSE_FILE, TestMode.PACED_CLOSE ->
+        "HTTP/1.1 CONNECTION_CLOSE; no Content-Length or Transfer-Encoding"
+    TestMode.PACED_CLOSE_HTTP10 ->
+        "HTTP/1.0 CONNECTION_CLOSE; no Content-Length or Transfer-Encoding"
+    else -> "HTTP/1.1 CONTENT_LENGTH; finite body ends at its declared length"
+  }
+
+  private fun safeProtocol(protocol: String): String =
+      if (protocol in setOf("HTTP/1.0", "HTTP/1.1")) protocol else "UNKNOWN"
+
+  private fun safeFraming(framing: String): String =
+      if (framing in setOf("CONTENT_LENGTH", "CHUNKED", "CONNECTION_CLOSE")) framing else "UNKNOWN"
 
   private suspend fun prepareStreamSource(run: TestRun): String? {
     val loopback = InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))
@@ -342,13 +366,20 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
       TestMode.FRAGMENTED_FILE -> StreamProbeHttpServer.Delivery.FILE
       TestMode.PACED_FILE -> StreamProbeHttpServer.Delivery.PACED_FILE
       TestMode.PACED_CHUNKED -> StreamProbeHttpServer.Delivery.PACED_CHUNKED
+      TestMode.CHUNKED_FILE -> StreamProbeHttpServer.Delivery.CHUNKED_FILE
+      TestMode.CLOSE_FILE -> StreamProbeHttpServer.Delivery.CLOSE_FILE
+      TestMode.PACED_CLOSE -> StreamProbeHttpServer.Delivery.PACED_CLOSE
+      TestMode.PACED_CLOSE_HTTP10 -> StreamProbeHttpServer.Delivery.PACED_CLOSE_HTTP10
       else -> return null
     }
-    val paced = delivery != StreamProbeHttpServer.Delivery.FILE
+    val paced = run.mode in setOf(TestMode.PACED_FILE, TestMode.PACED_CHUNKED,
+        TestMode.PACED_CLOSE, TestMode.PACED_CLOSE_HTTP10)
     val pacingMs = if (paced) STREAM_PACING_MS else 0L
     // With a known Content-Length, the client sees end-of-body at the last byte.
-    // Only chunked delivery can withhold its framing terminator after the payload.
-    val eofHoldMs = if (delivery == StreamProbeHttpServer.Delivery.PACED_CHUNKED) STREAM_EOF_HOLD_MS else 0L
+    // Unknown-length responses can hold the chunk terminator or socket EOF instead.
+    val unknownLength = run.mode in setOf(TestMode.CHUNKED_FILE, TestMode.PACED_CHUNKED,
+        TestMode.CLOSE_FILE, TestMode.PACED_CLOSE, TestMode.PACED_CLOSE_HTTP10)
+    val eofHoldMs = if (unknownLength) STREAM_EOF_HOLD_MS else 0L
     var temporary: StreamProbeHttpServer? = null
     var assetBytes = 0L
     try {
@@ -538,11 +569,18 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
       return
     }
     val snapshot = server.transferSnapshot
-    val ignoredChunkedRange = snapshot.rangeRequested && run.mode == TestMode.PACED_CHUNKED &&
-        snapshot.status == 200
+    val requestProtocol = safeProtocol(snapshot.requestProtocol)
+    val responseProtocol = safeProtocol(snapshot.responseProtocol)
+    val framing = safeFraming(snapshot.framing)
+    if (snapshot.id > 0) {
+      actualTransportReport = "requestProtocol=$requestProtocol, responseProtocol=$responseProtocol, " +
+          "framing=$framing, rangeRequested=${snapshot.rangeRequested}"
+    }
+    val ignoredUnknownLengthRange = snapshot.rangeRequested &&
+        framing in setOf("CHUNKED", "CONNECTION_CLOSE") && snapshot.status == 200
     val singleFullGet = snapshot.id > 0 && snapshot.totalGetCount == 1L &&
         snapshot.activeGetCount <= 1 && snapshot.status == 200 &&
-        (!snapshot.rangeRequested || ignoredChunkedRange) &&
+        (!snapshot.rangeRequested || ignoredUnknownLengthRange) &&
         snapshot.start == 0L && snapshot.end == run.streamAssetBytes - 1L &&
         snapshot.plannedBytes == run.streamAssetBytes
     val summary = when {
@@ -564,6 +602,7 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
       else -> "The first-PLAYING transfer snapshot is inconclusive. Confirm video in glasses."
     }
     val exact = "First SDK PLAYING snapshot: transfer=${snapshot.id}, " +
+        "requestProtocol=$requestProtocol, responseProtocol=$responseProtocol, framing=$framing, " +
         "bytesSent=${snapshot.bytesSent}, plannedBytes=${snapshot.plannedBytes}, " +
         "payloadComplete=${snapshot.payloadComplete}, responseComplete=${snapshot.responseComplete}, " +
         "writeInProgress=${snapshot.writeInProgress}, " +
@@ -574,7 +613,7 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
     firstPlaySnapshotReport = "$exact\n$summary\n" +
         "Bytes measure server socket writes, not client receipt, decoding or visible display. " +
         "SDK PLAYING alone does not confirm video in glasses."
-    val rangeCaveat = if (ignoredChunkedRange) {
+    val rangeCaveat = if (ignoredUnknownLengthRange) {
       " Range was ignored for the full 200 response; seeking/range support is not established."
     } else ""
     firstPlaySnapshotReport += rangeCaveat
@@ -828,9 +867,15 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
         "headers_too_large", "malformed_request", "method_not_allowed", "not_found",
         "range_not_satisfiable", "read_timeout", "request_line_too_long", "served",
         "server_error", "stopped", "write_failed", "started", "progress", "range_ignored",
-        "served_range_ignored")
+        "served_range_ignored", "http10_fallback", "served_http10_fallback")
     val outcome = if (event.outcome in outcomes) event.outcome else "other"
-    record("Stream HTTP $method ${event.phase.name}: transfer=${event.transferId}, " +
+    val requestProtocol = safeProtocol(event.requestProtocol)
+    val responseProtocol = safeProtocol(event.responseProtocol)
+    val framing = safeFraming(event.framing)
+    val transport = "requestProtocol=$requestProtocol, responseProtocol=$responseProtocol, " +
+        "framing=$framing, rangeRequested=${event.rangeRequested}"
+    if (event.assetRequest) actualTransportReport = transport
+    record("Stream HTTP $method ${event.phase.name}: $transport, transfer=${event.transferId}, " +
         "status=${event.status}, bytes=${event.bytesSent}, range=${event.start}-${event.end}, " +
         "asset=${event.assetRequest}, outcome=$outcome")
     updateHttpCounts(run)
@@ -858,7 +903,7 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
   fun copyReport(): String {
     val snapshot = _state.value
     return buildString {
-      appendLine("MetaDisplay transport probe 0.2; SDK 1.0.1")
+      appendLine("MetaDisplay transport probe 0.3; SDK 1.0.1")
       appendLine("Finite MP4 fixtures and the original public reference URL; no camera capture.")
       appendLine("New stream fixtures: 20-second silent H.264; control and fMP4 share encoded packets.")
       appendLine("SDK PLAYING/ENDED does not confirm visible playback in glasses.")
@@ -866,6 +911,8 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
       appendLine("Registration: ${snapshot.registration}")
       appendLine("Device: $reportDeviceStatus")
       appendLine("Mode: ${snapshot.currentMode}; phase: ${snapshot.phase}")
+      appendLine("Configured response: $configuredTransportReport")
+      appendLine("Observed response: $actualTransportReport")
       appendLine("Player: ${snapshot.playerState}; error: ${snapshot.lastError ?: "none"}")
       appendLine("Cleanup blocked: $cleanupBlocked")
       cleanupBlockReason?.let { appendLine("Cleanup block details: $it") }

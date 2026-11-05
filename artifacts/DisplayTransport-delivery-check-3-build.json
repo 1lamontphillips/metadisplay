@@ -1,0 +1,25 @@
+{
+  "application_id": "com.lamontphillips.metadisplay.transporttest",
+  "version_code": 3,
+  "version": "0.3-delivery-check",
+  "sdk": "1.0.1",
+  "apk_sha256": "89a0e71e5b1f4f4f6209f084711642672cb7d5bc64be57aad14d367e5b208f4e",
+  "zip_sha256": "9c69988332e6733769008af1d1147e9cb55a925e8d34c46e761c8da8a812f0f3",
+  "zip_bytes": 21742249,
+  "checks": {
+    "http_protocol_cases": "95 passed; 0 failed (39 original + 56 stream server)",
+    "debug_build": "passed",
+    "lint": {
+      "Warning": 3
+    },
+    "apk_signature": "verified; same certificate as transport tests 1 and 2",
+    "assets": "all three bundled MP4s match checked-in source assets",
+    "real_media_integration": {
+      "PACED_CLOSE": "480 frames decoded; first output338ms,12288/313014bytes written; payload/response incomplete",
+      "PACED_CLOSE_HTTP10": "480 frames decoded; first output345ms,12288/313014bytes written; payload/response incomplete",
+      "CHUNKED_FILE": "480 frames decoded"
+    },
+    "camera_and_microphone_permissions": "absent"
+  },
+  "limits": "Standard-decoder checks do not establish Meta glasses compatibility. Unknown-length device playback and indefinite camera streaming remain unverified."
+}

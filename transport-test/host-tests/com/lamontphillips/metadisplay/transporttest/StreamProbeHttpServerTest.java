@@ -59,6 +59,27 @@ public final class StreamProbeHttpServerTest {
     tests.add(new NamedCase("latest GET owns snapshot across older completion", StreamProbeHttpServerTest::overlappingGets));
     tests.add(new NamedCase("HEAD cannot replace an active GET snapshot", StreamProbeHttpServerTest::headPreservesSnapshot));
 
+    tests.add(new NamedCase("CHUNKED_FILE is immediate with exact chunk decoding", StreamProbeHttpServerTest::instantChunked));
+    tests.add(new NamedCase("CLOSE_FILE is immediate with exact raw bytes", StreamProbeHttpServerTest::instantClose));
+    tests.add(new NamedCase("PACED_CLOSE has an early partial raw payload", () -> pacedClose(StreamProbeHttpServer.Delivery.PACED_CLOSE)));
+    tests.add(new NamedCase("PACED_CLOSE_HTTP10 has an early partial raw payload", () -> pacedClose(StreamProbeHttpServer.Delivery.PACED_CLOSE_HTTP10)));
+    for (StreamProbeHttpServer.Delivery delivery : new StreamProbeHttpServer.Delivery[] {
+        StreamProbeHttpServer.Delivery.CHUNKED_FILE,
+        StreamProbeHttpServer.Delivery.CLOSE_FILE,
+        StreamProbeHttpServer.Delivery.PACED_CLOSE,
+        StreamProbeHttpServer.Delivery.PACED_CLOSE_HTTP10}) {
+      tests.add(new NamedCase(delivery + " HEAD ignores Range and pacing", () -> unknownHead(delivery)));
+      tests.add(new NamedCase(delivery + " ignores malformed Range", () -> unknownRangeIgnored(delivery)));
+      tests.add(new NamedCase(delivery + " errors retain Content-Length zero", () -> unknownErrors(delivery)));
+      tests.add(new NamedCase(delivery + " EOF hold separates payload and response", () -> unknownEofHold(delivery, false)));
+      tests.add(new NamedCase(delivery + " stop interrupts EOF hold", () -> unknownEofHold(delivery, true)));
+    }
+    tests.add(new NamedCase("PACED_CLOSE cancellation retains partial flags", () -> stopDuringClosePayload(StreamProbeHttpServer.Delivery.PACED_CLOSE)));
+    tests.add(new NamedCase("PACED_CLOSE_HTTP10 cancellation retains partial flags", () -> stopDuringClosePayload(StreamProbeHttpServer.Delivery.PACED_CLOSE_HTTP10)));
+    tests.add(new NamedCase("HTTP/1.0 close mode accepts an HTTP/1.0 request", StreamProbeHttpServerTest::http10Request));
+    tests.add(new NamedCase("CHUNKED_FILE falls back to raw close for HTTP/1.0", () -> http10ChunkFallback(StreamProbeHttpServer.Delivery.CHUNKED_FILE)));
+    tests.add(new NamedCase("PACED_CHUNKED falls back to raw close for HTTP/1.0", () -> http10ChunkFallback(StreamProbeHttpServer.Delivery.PACED_CHUNKED)));
+
     int failures = 0;
     for (NamedCase test : tests) {
       try {
@@ -331,6 +352,261 @@ public final class StreamProbeHttpServerTest {
     }
   }
 
+  private static void instantChunked() throws Exception {
+    // Configure nonzero pacing deliberately: this delivery mode must still be immediate.
+    try (Fixture fixture = new Fixture(StreamProbeHttpServer.Delivery.CHUNKED_FILE, 1800, 0)) {
+      long startedAt = System.nanoTime();
+      try (Client client = fixture.request("GET", "Range: bytes=7-30\r\n")) {
+        unknownHeaders(client, StreamProbeHttpServer.Delivery.CHUNKED_FILE);
+        equalBytes(CONTENT, client.readChunkedPayload(CONTENT.length), "instant decoded chunked body");
+        client.readChunkTerminator();
+        client.expectEof();
+        check(elapsed(startedAt) < 1200, "CHUNKED_FILE must not inherit configured pacing");
+        StreamProbeHttpServer.Event complete = fixture.event(StreamProbeHttpServer.Phase.COMPLETE, 0);
+        event(complete, StreamProbeHttpServer.Phase.COMPLETE, 200, CONTENT.length, 0, CONTENT.length - 1);
+        completedSnapshot(fixture, complete.transferId, CONTENT.length, 0);
+        equal(CONTENT.length, fixture.server.getBytesServed(), "instant chunk framing is not payload");
+      }
+    }
+  }
+
+  private static void instantClose() throws Exception {
+    try (Fixture fixture = new Fixture(StreamProbeHttpServer.Delivery.CLOSE_FILE, 1800, 0)) {
+      long startedAt = System.nanoTime();
+      try (Client client = fixture.request("GET", "Range: bytes=7-30\r\n")) {
+        unknownHeaders(client, StreamProbeHttpServer.Delivery.CLOSE_FILE);
+        equalBytes(CONTENT, client.readFixed(CONTENT.length), "instant raw close-delimited body has no chunk framing");
+        client.expectEof();
+        check(elapsed(startedAt) < 1200, "CLOSE_FILE must not inherit configured pacing");
+        StreamProbeHttpServer.Event complete = fixture.event(StreamProbeHttpServer.Phase.COMPLETE, 0);
+        event(complete, StreamProbeHttpServer.Phase.COMPLETE, 200, CONTENT.length, 0, CONTENT.length - 1);
+        completedSnapshot(fixture, complete.transferId, CONTENT.length, 0);
+        equal(CONTENT.length, fixture.server.getBytesServed(), "close-delimited body count");
+      }
+    }
+  }
+
+  private static void pacedClose(StreamProbeHttpServer.Delivery delivery) throws Exception {
+    try (Fixture fixture = new Fixture(delivery, 1000, 0)) {
+      long startedAt = System.nanoTime();
+      try (Client client = fixture.request("GET", "")) {
+        unknownHeaders(client, delivery);
+        StreamProbeHttpServer.Event started = fixture.event(StreamProbeHttpServer.Phase.STARTED, 0);
+        event(started, StreamProbeHttpServer.Phase.STARTED, 200, 0, 0, CONTENT.length - 1);
+        byte[] first = client.readFixed(1);
+        StreamProbeHttpServer.TransferSnapshot partial = fixture.snapshot(value -> value.id == started.transferId
+            && value.bytesSent > 0 && value.bytesSent < value.plannedBytes);
+        equal(CONTENT.length, partial.plannedBytes, "close-delimited planned bytes");
+        equal(1, partial.activeGetCount, "close-delimited GET active while paced");
+        check(!partial.payloadComplete && !partial.responseComplete, "early close-delimited flags are partial");
+        equalBytes(CONTENT, concatenate(first, client.readFixed(CONTENT.length - 1)),
+            "paced raw body has neither chunk framing nor omitted bytes");
+        client.expectEof();
+        check(elapsed(startedAt) >= 600, "close-delimited payload must be paced");
+        fixture.event(StreamProbeHttpServer.Phase.COMPLETE, started.transferId);
+        completedSnapshot(fixture, started.transferId, CONTENT.length, 0);
+        eventOrder(fixture, started.transferId, CONTENT.length, true);
+      }
+    }
+  }
+
+  private static void unknownHead(StreamProbeHttpServer.Delivery delivery) throws Exception {
+    try (Fixture fixture = new Fixture(delivery, 1800, 1800)) {
+      long startedAt = System.nanoTime();
+      try (Client client = fixture.request("HEAD", "Range: bytes=7-30\r\n")) {
+        unknownHeaders(client, delivery);
+        client.expectEof();
+      }
+      check(elapsed(startedAt) < 1200, "unknown-length HEAD must not wait for pacing or EOF hold");
+      emptySnapshot(fixture.server.getTransferSnapshot());
+      equal(1, fixture.server.getRequestCount(), "HEAD is counted without an active GET");
+      equal(0, fixture.server.getBytesServed(), "HEAD has no raw body or chunk terminator");
+    }
+  }
+
+  private static void unknownRangeIgnored(StreamProbeHttpServer.Delivery delivery) throws Exception {
+    try (Fixture fixture = new Fixture(delivery, 120, 0);
+        Client client = fixture.request("GET", "Range: bytes=0-9223372036854775808\r\nRange: bytes=9-8\r\n")) {
+      unknownHeaders(client, delivery);
+      equalBytes(CONTENT, readUnknownPayload(client, delivery), "ignored invalid Range still returns the whole asset");
+      if (delivery == StreamProbeHttpServer.Delivery.CHUNKED_FILE) client.readChunkTerminator();
+      client.expectEof();
+      StreamProbeHttpServer.Event complete = fixture.event(StreamProbeHttpServer.Phase.COMPLETE, 0);
+      event(complete, StreamProbeHttpServer.Phase.COMPLETE, 200, CONTENT.length, 0, CONTENT.length - 1);
+      equal("served_range_ignored", complete.outcome, "ignored Range uses a fixed safe outcome");
+      completedSnapshot(fixture, complete.transferId, CONTENT.length, 0);
+      transportMetadata(complete, fixture.server.getTransferSnapshot(), "HTTP/1.1",
+          delivery == StreamProbeHttpServer.Delivery.PACED_CLOSE_HTTP10 ? "HTTP/1.0" : "HTTP/1.1",
+          delivery == StreamProbeHttpServer.Delivery.CHUNKED_FILE ? "CHUNKED" : "CONNECTION_CLOSE", true);
+    }
+  }
+
+  private static void unknownErrors(StreamProbeHttpServer.Delivery delivery) throws Exception {
+    try (Fixture fixture = new Fixture(delivery, 1800, 1800)) {
+      for (boolean wrongPath : new boolean[] {true, false}) {
+        String path = wrongPath ? "/not-the-token/sample.mp4" : fixture.server.getPath();
+        try (Client client = fixture.requestTarget(wrongPath ? "GET" : "POST", path,
+            "Content-Length: 0\r\n", "HTTP/1.1")) {
+          equal(wrongPath ? 404 : 405, client.status, "unknown-length mode error status");
+          equal("0", client.header("content-length"), "errors explicitly declare an empty body");
+          check(!client.headers.containsKey("transfer-encoding"), "errors are not chunk-framed");
+          check(!client.headers.containsKey("content-range"), "errors have no media range");
+          client.expectEof();
+        }
+      }
+      emptySnapshot(fixture.server.getTransferSnapshot());
+      equal(0, fixture.server.getRequestCount(), "errors do not count as successful asset requests");
+      equal(0, fixture.server.getBytesServed(), "errors send no payload or framing");
+    }
+  }
+
+  private static void unknownEofHold(StreamProbeHttpServer.Delivery delivery, boolean stop) throws Exception {
+    try (Fixture fixture = new Fixture(delivery, 180, stop ? 2500 : 800);
+        Client client = fixture.request("GET", "")) {
+      unknownHeaders(client, delivery);
+      equalBytes(CONTENT, readUnknownPayload(client, delivery), "all payload precedes unknown-length EOF hold");
+      StreamProbeHttpServer.TransferSnapshot held = fixture.snapshot(value -> value.payloadComplete
+          && !value.responseComplete && value.activeGetCount == 1);
+      equal(CONTENT.length, held.bytesSent, "EOF hold follows the complete payload");
+      equal(CONTENT.length, held.plannedBytes, "EOF hold retains planned bytes");
+      client.expectStillOpen(150);
+      StreamProbeHttpServer.TransferSnapshot stillHeld = fixture.server.getTransferSnapshot();
+      check(stillHeld.payloadComplete && !stillHeld.responseComplete,
+          "payload completion and flush cannot mark a close-delimited response complete before EOF");
+      check(fixture.history.stream().noneMatch(event -> event.transferId == held.id
+          && event.phase == StreamProbeHttpServer.Phase.COMPLETE), "COMPLETE waits for EOF or abort");
+      if (stop) {
+        long stoppedAt = System.nanoTime();
+        fixture.server.close();
+        check(elapsed(stoppedAt) < 1800, "server stop interrupts unknown-length EOF hold");
+        check(!fixture.server.isRunning(), "stopped endpoint reports not running");
+        equal(0, client.readUntilClosedAllowReset().length, "stop adds no body or chunk terminator");
+        StreamProbeHttpServer.Event complete = fixture.event(StreamProbeHttpServer.Phase.COMPLETE, held.id);
+        equal("stopped", complete.outcome, "canceled EOF hold has a stopped outcome");
+        StreamProbeHttpServer.TransferSnapshot aborted = fixture.snapshot(value -> value.activeGetCount == 0);
+        equal(held.id, aborted.id, "EOF cancellation retains the transfer identity");
+        equal(CONTENT.length, aborted.bytesSent, "EOF cancellation follows all payload bytes");
+        check(aborted.payloadComplete, "payload remains complete after EOF-hold cancellation");
+        check(!aborted.responseComplete, "cancellation cannot mark successful response completion");
+      } else {
+        if (delivery == StreamProbeHttpServer.Delivery.CHUNKED_FILE) client.readChunkTerminator();
+        client.expectEof();
+        fixture.event(StreamProbeHttpServer.Phase.COMPLETE, held.id);
+        completedSnapshot(fixture, held.id, CONTENT.length, 0);
+      }
+    }
+  }
+
+  private static void stopDuringClosePayload(StreamProbeHttpServer.Delivery delivery) throws Exception {
+    try (Fixture fixture = new Fixture(delivery, 2200, 800);
+        Client client = fixture.request("GET", "")) {
+      unknownHeaders(client, delivery);
+      client.readFixed(1);
+      StreamProbeHttpServer.TransferSnapshot partial = fixture.snapshot(value -> value.id > 0
+          && value.bytesSent > 0 && value.bytesSent < value.plannedBytes);
+      long stoppedAt = System.nanoTime();
+      fixture.server.close();
+      check(elapsed(stoppedAt) < 1800, "stop interrupts close-delimited payload pacing");
+      client.readUntilClosedAllowReset();
+      StreamProbeHttpServer.Event complete = fixture.event(StreamProbeHttpServer.Phase.COMPLETE, partial.id);
+      equal("stopped", complete.outcome, "canceled payload has a stopped outcome");
+      StreamProbeHttpServer.TransferSnapshot aborted = fixture.snapshot(value -> value.activeGetCount == 0);
+      equal(partial.id, aborted.id, "canceled close transfer identity");
+      check(aborted.bytesSent < aborted.plannedBytes, "canceled close-delimited payload remains partial");
+      check(!aborted.payloadComplete && !aborted.responseComplete,
+          "socket closure cannot turn a truncated planned payload into successful completion");
+    }
+  }
+
+  private static void http10Request() throws Exception {
+    try (Fixture fixture = new Fixture(StreamProbeHttpServer.Delivery.PACED_CLOSE_HTTP10, 120, 0);
+        Client client = fixture.requestTarget("GET", fixture.server.getPath(), "", "HTTP/1.0")) {
+      unknownHeaders(client, StreamProbeHttpServer.Delivery.PACED_CLOSE_HTTP10);
+      equalBytes(CONTENT, client.readFixed(CONTENT.length), "HTTP/1.0 request receives exact raw payload");
+      client.expectEof();
+      StreamProbeHttpServer.Event complete = fixture.event(StreamProbeHttpServer.Phase.COMPLETE, 0);
+      completedSnapshot(fixture, complete.transferId, CONTENT.length, 0);
+      transportMetadata(complete, fixture.server.getTransferSnapshot(),
+          "HTTP/1.0", "HTTP/1.0", "CONNECTION_CLOSE", false);
+    }
+  }
+
+  private static void http10ChunkFallback(StreamProbeHttpServer.Delivery delivery) throws Exception {
+    try (Fixture fixture = new Fixture(delivery, 400, 0)) {
+      try (Client head = fixture.requestTarget("HEAD", fixture.server.getPath(),
+          "Range: bytes=7-30\r\n", "HTTP/1.0")) {
+        closeHeaders(head, "HTTP/1.0");
+        head.expectEof();
+      }
+      StreamProbeHttpServer.Event head = fixture.event(StreamProbeHttpServer.Phase.COMPLETE, 0);
+      equal("HEAD", head.method, "HTTP/1.0 fallback HEAD event");
+      equal("HTTP/1.0", head.requestProtocol, "HEAD fallback records request protocol");
+      equal("HTTP/1.0", head.responseProtocol, "HEAD fallback records response protocol");
+      equal("CONNECTION_CLOSE", head.framing, "HEAD fallback records actual framing");
+      check(head.rangeRequested, "HEAD fallback records ignored Range");
+      emptySnapshot(fixture.server.getTransferSnapshot());
+      try (Client client = fixture.requestTarget("GET", fixture.server.getPath(),
+          "Range: bytes=7-30\r\n", "HTTP/1.0")) {
+        closeHeaders(client, "HTTP/1.0");
+        StreamProbeHttpServer.Event started = fixture.event(StreamProbeHttpServer.Phase.STARTED, 0);
+        event(started, StreamProbeHttpServer.Phase.STARTED, 200, 0, 0, CONTENT.length - 1);
+        equal("http10_fallback", started.outcome, "fallback STARTED has a safe fixed outcome");
+        transportMetadata(started, fixture.server.getTransferSnapshot(),
+            "HTTP/1.0", "HTTP/1.0", "CONNECTION_CLOSE", true);
+        equalBytes(CONTENT, client.readFixed(CONTENT.length), "HTTP/1.0 fallback body is raw full asset");
+        client.expectEof();
+        StreamProbeHttpServer.Event complete = fixture.event(StreamProbeHttpServer.Phase.COMPLETE, started.transferId);
+        equal("served_http10_fallback", complete.outcome, "fallback COMPLETE has a safe fixed outcome");
+        completedSnapshot(fixture, complete.transferId, CONTENT.length, 0);
+        transportMetadata(complete, fixture.server.getTransferSnapshot(),
+            "HTTP/1.0", "HTTP/1.0", "CONNECTION_CLOSE", true);
+      }
+      equal(2, fixture.server.getRequestCount(), "fallback HEAD plus GET request count");
+      equal(CONTENT.length, fixture.server.getBytesServed(), "fallback sends raw payload bytes once");
+    }
+  }
+
+  private static void transportMetadata(StreamProbeHttpServer.Event event,
+      StreamProbeHttpServer.TransferSnapshot snapshot, String requestProtocol,
+      String responseProtocol, String framing, boolean rangeRequested) {
+    equal(requestProtocol, event.requestProtocol, "event request protocol");
+    equal(responseProtocol, event.responseProtocol, "event response protocol");
+    equal(framing, event.framing, "event actual response framing");
+    check(event.rangeRequested == rangeRequested, "event records whether Range was requested");
+    equal(requestProtocol, snapshot.requestProtocol, "snapshot request protocol");
+    equal(responseProtocol, snapshot.responseProtocol, "snapshot response protocol");
+    equal(framing, snapshot.framing, "snapshot actual response framing");
+    check(snapshot.rangeRequested == rangeRequested, "snapshot records whether Range was requested");
+  }
+
+  private static byte[] readUnknownPayload(Client client, StreamProbeHttpServer.Delivery delivery)
+      throws IOException {
+    return delivery == StreamProbeHttpServer.Delivery.CHUNKED_FILE
+        ? client.readChunkedPayload(CONTENT.length) : client.readFixed(CONTENT.length);
+  }
+
+  private static void unknownHeaders(Client client, StreamProbeHttpServer.Delivery delivery) {
+    equal(delivery == StreamProbeHttpServer.Delivery.PACED_CLOSE_HTTP10 ? "HTTP/1.0" : "HTTP/1.1",
+        client.protocol, "delivery response protocol");
+    if (delivery == StreamProbeHttpServer.Delivery.CHUNKED_FILE) {
+      chunkedHeaders(client);
+      return;
+    }
+    closeHeaders(client, delivery == StreamProbeHttpServer.Delivery.PACED_CLOSE_HTTP10
+        ? "HTTP/1.0" : "HTTP/1.1");
+  }
+
+  private static void closeHeaders(Client client, String protocol) {
+    equal(protocol, client.protocol, "raw close-delimited response protocol");
+    equal(200, client.status, "close-delimited response ignores Range with full 200");
+    equal("video/mp4", client.header("content-type"), "close-delimited MP4 type");
+    equal("none", client.header("accept-ranges"), "close-delimited Accept-Ranges");
+    equal("close", client.header("connection").toLowerCase(Locale.ROOT), "close-delimited connection policy");
+    check(!client.headers.containsKey("content-length"), "close-delimited success has no Content-Length");
+    check(!client.headers.containsKey("transfer-encoding"), "close-delimited success has no Transfer-Encoding");
+    check(!client.headers.containsKey("content-range"), "close-delimited success has no Content-Range");
+  }
+
   private static void emptySnapshot(StreamProbeHttpServer.TransferSnapshot snapshot) {
     equal(0, snapshot.id, "no GET transfer identity");
     equal(0, snapshot.bytesSent, "no GET payload bytes");
@@ -475,11 +751,15 @@ public final class StreamProbeHttpServerTest {
     }
 
     Client request(String method, String headers) throws IOException {
+      return requestTarget(method, server.getPath(), headers, "HTTP/1.1");
+    }
+
+    Client requestTarget(String method, String target, String headers, String protocol) throws IOException {
       Socket socket = new Socket();
       try {
         socket.connect(new InetSocketAddress(address, server.getPort()), 2000);
         socket.setSoTimeout(SOCKET_TIMEOUT_MS);
-        String text = method + " " + server.getPath() + " HTTP/1.1\r\nHost: localhost\r\n"
+        String text = method + " " + target + " " + protocol + "\r\nHost: localhost\r\n"
             + "Connection: close\r\n" + headers + "\r\n";
         socket.getOutputStream().write(text.getBytes(StandardCharsets.US_ASCII));
         socket.getOutputStream().flush();
@@ -520,6 +800,7 @@ public final class StreamProbeHttpServerTest {
   private static final class Client implements AutoCloseable {
     final Socket socket;
     final InputStream input;
+    final String protocol;
     final int status;
     final Map<String, String> headers = new LinkedHashMap<>();
 
@@ -528,6 +809,7 @@ public final class StreamProbeHttpServerTest {
       input = socket.getInputStream();
       String[] statusLine = readLine().split(" +", 3);
       check(statusLine.length >= 2 && statusLine[0].startsWith("HTTP/1."), "HTTP status line");
+      protocol = statusLine[0];
       status = Integer.parseInt(statusLine[1]);
       int headerCount = 0;
       while (true) {

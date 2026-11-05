@@ -1,6 +1,6 @@
 # Display Access Android sample
 
-The latest experiment is [Display Transport Test: streaming check 2](./DisplayTransport-stream-check-2.zip). Phone-hosted finite MP4 playback has been confirmed in the glasses; this update checks whether playback can begin before all video bytes arrive. See its [phone instructions](./DisplayTransport-stream-check-2-INSTALL.md). It updates the separate test app and keeps Display Access installed.
+The latest experiment is [Display Transport Test: delivery check 3](./DisplayTransport-delivery-check-3.zip). Smooth progressive playback of a known-length phone-hosted MP4 has been confirmed in the glasses; this update compares unknown-length delivery methods. See its [phone instructions](./DisplayTransport-delivery-check-3-INSTALL.md). It updates the separate test app and keeps Display Access installed.
 
 ## Diagnostic update
 

@@ -8,6 +8,10 @@ enum class TestMode {
   FRAGMENTED_FILE,
   PACED_FILE,
   PACED_CHUNKED,
+  CHUNKED_FILE,
+  CLOSE_FILE,
+  PACED_CLOSE,
+  PACED_CLOSE_HTTP10,
 }
 
 data class TransportState(

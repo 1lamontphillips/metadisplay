@@ -131,9 +131,9 @@ private fun TransportScreen(
     ) {
       Text("Display Transport Test", style = MaterialTheme.typography.headlineMedium,
           fontWeight = FontWeight.Bold)
-      Text("Streaming compatibility checks", style = MaterialTheme.typography.titleMedium)
+      Text("Delivery compatibility checks", style = MaterialTheme.typography.titleMedium)
       Text(
-          "These silent video tests compare MP4 formats and gradual delivery from your phone. Camera capture comes after these checks.",
+          "These silent 20-second tests compare delivery without a declared final file size. They use bundled test footage; camera capture comes after these checks.",
           style = MaterialTheme.typography.bodyLarge,
       )
       Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
@@ -158,37 +158,65 @@ private fun TransportScreen(
         }
       }
       SourceCard(
-          title = "1 · Silent MP4 control",
-          description = "Play a normal 20-second MP4 from the phone. This checks the new test pictures before changing their container.",
-          button = "Play silent control",
+          title = "1 · Direct stream",
+          description = "Send the clip gradually as raw media bytes. The connection closes when this finite test finishes.",
+          button = "Play direct stream",
           enabled = state.canStart && !state.busy,
-          onClick = { onStart(TestMode.STREAM_CONTROL) },
+          onClick = { onStart(TestMode.PACED_CLOSE) },
       )
       SourceCard(
-          title = "2 · Fragmented MP4",
-          description = "Play the same encoded pictures in fragmented MP4 format, delivered immediately.",
-          button = "Play fragmented clip",
+          title = "2 · Compatibility stream",
+          description = "Send the same gradual stream using an older HTTP response version for comparison.",
+          button = "Play compatibility stream",
           enabled = state.canStart && !state.busy,
-          onClick = { onStart(TestMode.FRAGMENTED_FILE) },
+          onClick = { onStart(TestMode.PACED_CLOSE_HTTP10) },
       )
       SourceCard(
-          title = "3 · Gradual delivery",
-          description = "Deliver the fragments gradually over about 20 seconds. The report checks whether playback starts while bytes are still arriving.",
-          button = "Play gradual delivery",
+          title = "3 · Chunked control",
+          description = "Send the clip immediately using chunked delivery. This compares framing with the earlier gradual chunked test.",
+          button = "Play chunked control",
           enabled = state.canStart && !state.busy,
-          onClick = { onStart(TestMode.PACED_FILE) },
-      )
-      SourceCard(
-          title = "4 · Unknown-length stream",
-          description = "Test gradual delivery without announcing a final file length, as a continuous source would require.",
-          button = "Play stream check",
-          enabled = state.canStart && !state.busy,
-          onClick = { onStart(TestMode.PACED_CHUNKED) },
+          onClick = { onStart(TestMode.CHUNKED_FILE) },
       )
       TextButton(onClick = { showBaseline = !showBaseline }) {
         Text(if (showBaseline) "Hide earlier transport tests" else "Show earlier transport tests")
       }
       if (showBaseline) {
+        SourceCard(
+            title = "Direct control",
+            description = "Send the raw media immediately without a declared length, then close the connection.",
+            button = "Play direct control",
+            enabled = state.canStart && !state.busy,
+            onClick = { onStart(TestMode.CLOSE_FILE) },
+        )
+        SourceCard(
+            title = "Known-length gradual delivery",
+            description = "Repeat the successful gradual-delivery check with its known final file length.",
+            button = "Play gradual delivery",
+            enabled = state.canStart && !state.busy,
+            onClick = { onStart(TestMode.PACED_FILE) },
+        )
+        SourceCard(
+            title = "Gradual chunked delivery",
+            description = "Repeat the earlier gradual chunked test. The report records the actual HTTP response framing.",
+            button = "Play stream check",
+            enabled = state.canStart && !state.busy,
+            onClick = { onStart(TestMode.PACED_CHUNKED) },
+        )
+        SourceCard(
+            title = "Silent MP4 control",
+            description = "Play a normal 20-second MP4 from the phone.",
+            button = "Play silent control",
+            enabled = state.canStart && !state.busy,
+            onClick = { onStart(TestMode.STREAM_CONTROL) },
+        )
+        SourceCard(
+            title = "Fragmented MP4 control",
+            description = "Play the same encoded pictures in fragmented MP4 format, delivered immediately.",
+            button = "Play fragmented clip",
+            enabled = state.canStart && !state.busy,
+            onClick = { onStart(TestMode.FRAGMENTED_FILE) },
+        )
         SourceCard(
             title = "1 · Internet reference",
             description = "Play the original clip from its internet URL. This checks the new app's connection and player.",
