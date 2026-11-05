@@ -1,5 +1,7 @@
 # Display Access Android sample
 
+The next experiment is a separate [Display Transport Test](./DisplayTransport-test-1.zip), which checks phone-hosted finite MP4 reachability without replacing this working sample. See its [phone instructions](./DisplayTransport-test-1-INSTALL.md).
+
 ## Diagnostic update
 
 For a session that starts but ends when opening a tutorial, use [diagnostic update 2](./DisplayAccess-diagnostics-2.zip). It starts the detail screen without its large image for comparison and labels menu/detail/step and video events. See the [test instructions](./DisplayAccess-diagnostics-2-INSTALL.md) and [source changes](./DisplayAccess-diagnostics-2.patch). This is a controlled isolation test, not a confirmed fix.

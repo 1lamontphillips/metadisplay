@@ -1,0 +1,20 @@
+{
+  "application_id": "com.lamontphillips.metadisplay.transporttest",
+  "version": "0.1-transport",
+  "sdk_version": "1.0.1",
+  "minimum_android_api": 31,
+  "apk_sha256": "791f38b9b3cd259e8b584f6fe0c1ef98d0d1286b023eb351cb2927f9da3fb452",
+  "zip_sha256": "672321de377e43fe3bb1cec0e8783e14bfba36693c5def7898e1f5bdca5013dd",
+  "zip_bytes": 21101407,
+  "checks": {
+    "android_build": "passed",
+    "android_lint": "0 errors; 3 warnings (2 pinned-tool version notices and intentional local-fixture HTTP configuration)",
+    "host_http_protocol_tests": "39 passed; 0 failed",
+    "apk_signature": "verified",
+    "asset_integrity": "verified",
+    "camera_permission": "not declared",
+    "separate_app_identity": "verified"
+  },
+  "device_validation": "not performed; phone/glasses test required",
+  "continuous_camera_streaming": "not implemented or proven by this finite-clip probe"
+}
