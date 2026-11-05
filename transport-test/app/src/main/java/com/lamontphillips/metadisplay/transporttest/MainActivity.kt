@@ -79,6 +79,8 @@ class MainActivity : ComponentActivity() {
             onPermission = { permissionRequest.launch(Manifest.permission.BLUETOOTH_CONNECT) },
             onConnect = { model.connect(this) },
             onCameraPermission = { cameraPermissionRequest.launch(Manifest.permission.CAMERA) },
+            onRotateView = model::rotateCameraView,
+            onToggleFraming = model::toggleCameraFraming,
             onStart = { mode -> model.startTest(mode, display?.rotation ?: Surface.ROTATION_0) },
             onStop = model::stopTest,
             onCopy = {
@@ -120,6 +122,8 @@ private fun TransportScreen(
     onPermission: () -> Unit,
     onConnect: () -> Unit,
     onCameraPermission: () -> Unit,
+    onRotateView: () -> Unit,
+    onToggleFraming: () -> Unit,
     onStart: (TestMode) -> Unit,
     onStop: () -> Unit,
     onCopy: () -> Unit,
@@ -148,9 +152,9 @@ private fun TransportScreen(
     ) {
       Text("Display Transport Test", style = MaterialTheme.typography.headlineMedium,
           fontWeight = FontWeight.Bold)
-      Text("Camera cadence check", style = MaterialTheme.typography.titleMedium)
+      Text("Camera view check", style = MaterialTheme.typography.titleMedium)
       Text(
-          "This update tests steadier camera frame pacing. Each experiment ends after 20 video fragments, about 20 seconds. Keep this app open.",
+          "Use Fill frame for a larger picture and Rotate 90° if needed. Each test ends after 20 video fragments, about 20 seconds. Keep this app open.",
           style = MaterialTheme.typography.bodyLarge,
       )
       Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
@@ -192,6 +196,26 @@ private fun TransportScreen(
           enabled = state.canStart && !state.busy,
           onClick = { if (cameraPermissionGranted) onStart(TestMode.LIVE_CAMERA) else onCameraPermission() },
       )
+      Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
+        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+          Text("Camera view", style = MaterialTheme.typography.titleLarge)
+          Text("Rotation adjustment: ${state.cameraRotationQuarterTurns * 90}° · " +
+              if (state.cameraFillFrame) "Fill frame" else "Show whole view")
+          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = onRotateView, modifier = Modifier.weight(1f)) {
+              Text("Rotate 90°")
+            }
+            OutlinedButton(onClick = onToggleFraming, modifier = Modifier.weight(1f)) {
+              Text(if (state.cameraFillFrame) "Show whole view" else "Fill frame")
+            }
+          }
+          Text(if (state.cameraFillFrame) "Fill frame uses a centered crop."
+              else "Show whole view keeps the entire image.",
+              style = MaterialTheme.typography.bodySmall)
+          Text("You can adjust before or during a test. Changes may take a couple of seconds to appear in the glasses; your choices are remembered.",
+              style = MaterialTheme.typography.bodySmall)
+        }
+      }
       TextButton(onClick = { showBaseline = !showBaseline }) {
         Text(if (showBaseline) "Hide earlier transport tests" else "Show earlier transport tests")
       }
@@ -293,6 +317,7 @@ private fun TransportScreen(
           Text("Phone clip requests: ${state.httpRequests} · bytes sent: ${state.httpBytes}")
           Text(state.cameraEvidence)
           if (state.cameraPacingEvidence.isNotEmpty()) Text(state.cameraPacingEvidence)
+          if (state.cameraViewEvidence.isNotEmpty()) Text(state.cameraViewEvidence)
           if (state.boundedEvidence.isNotEmpty()) Text(state.boundedEvidence)
           Text(state.streamEvidence, fontWeight = FontWeight.SemiBold)
           Text("Confirm playback by looking in the glasses. A player status alone does not confirm what you saw.",

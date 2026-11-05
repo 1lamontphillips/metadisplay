@@ -33,6 +33,9 @@ data class TransportState(
     val streamEvidence: String = "No first-PLAYING evidence yet",
     val cameraEvidence: String = "Camera inactive",
     val cameraPacingEvidence: String = "",
+    val cameraRotationQuarterTurns: Int = 0,
+    val cameraFillFrame: Boolean = true,
+    val cameraViewEvidence: String = "",
     val boundedEvidence: String = "",
     val events: List<String> = emptyList(),
 )

@@ -1,0 +1,56 @@
+{
+  "application_id": "com.lamontphillips.metadisplay.transporttest",
+  "version_code": 6,
+  "version": "0.6-camera-framing",
+  "sdk": "1.0.1",
+  "media3_muxer": "1.11.1",
+  "apk_sha256": "368876a3a0c2f8f021f991dceccb388d27ac0e745a01222d1fde966414c5cc65",
+  "zip_sha256": "af2d4f6be2e1fb38ac11718f866e56209bde72b8641607b952811e513a878a5f",
+  "zip_bytes": 23149336,
+  "camera_session": {
+    "fragment_slots": 20,
+    "slot_bytes": 65536,
+    "target_width": 266,
+    "target_height": 150,
+    "target_fps": 24,
+    "target_bitrate": 120000,
+    "overall_limit_seconds": 75,
+    "length": "Exact initialization bytes plus20 fixed slots; real finite limit, no estimated Content-Length"
+  },
+  "change": "SurfaceTexture transform retained once; display/manual UV adjustment; pixel-axis aspect; default centered-crop FILL, optional undistorted FIT; live saved quarter-turn/framing controls, no session or pacing reset.",
+  "checks": {
+    "host_cases": {
+      "ClipHttpServer": 39,
+      "StreamProbeHttpServer": 60,
+      "FixedBudgetMedia": 60,
+      "LiveClipHttpServer": 30,
+      "CameraFramePacer": 29,
+      "CameraViewTransform": 36,
+      "total": 254,
+      "failed": 0
+    },
+    "geometry_scenarios": 3081,
+    "geometry_coverage": "native/display/manual quarter turns, crop/flip/half-texel preservation, asymmetric orientation markers, source-pixel circles/no stretching, centering, bounds, invalid inputs, input immutability",
+    "final_debug_build": "passed",
+    "lint": {
+      "errors": 0,
+      "warnings": 5
+    },
+    "apk_signature": "verified; same certificate as earlier transport builds",
+    "permissions": "CAMERA present; microphone and external/media storage permissions absent; no new permissions",
+    "assets": "all three fixtures match source and remain unchanged",
+    "unchanged_mp4_pipeline_source_hashes": {
+      "FixedBudgetMp4.java": "dce7ccefccbdfb86755a9c16b83efc02f6f5426772df6fd07cbd6ef6be9e6824",
+      "BoundedMediaBuffer.java": "d459e253ed5ac3696b0b8f34b5bf834a9764abaabc195ff00b94e5e7ce13b9dc"
+    },
+    "unchanged_frame_pacer_sha256": "44c605b164a1c603051f3efd63a0fa17818aaa19e69d6d557e6e57f78dea9c25",
+    "independent_review": "geometry, live atomic options, applied-after-draw snapshot, saved preference initialization race, cleanup and report privacy reviewed",
+    "camera_change_source_sha256": {
+      "CameraViewTransform.java": "a3a5fee99ab8c67d408c1bef4846ee7bb5890af6919468192965e68fcf6eb461",
+      "PhoneCameraProducer.kt": "85b1ee009e97b19a82cf44812f5f6409cb173ec18ae9ab1df6a5b8b82cb9b63e",
+      "PhoneCameraEglRenderer.kt": "9a51ce9acdc81c68087a8a60f819c88f4b56632021f2cb0927bee6acbfb1c348",
+      "TransportViewModel.kt": "887a8cfa602c4553770e3578c947b1fd3c5b51b049cc45bdbfa79735d2853e44"
+    }
+  },
+  "limits": "Version0.5 showed live camera but upright-phone picture was sideways and narrow. Its encoder cadence was steady; visible readability/motion/latency improvement in0.6 remains unverified. Finite20-fragment experiment, not indefinite streaming."
+}

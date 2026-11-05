@@ -1,6 +1,6 @@
 # Display Access Android sample
 
-The latest experiment is [Display Transport Test: camera cadence check 5](./DisplayTransport-camera-cadence-5.zip). The user confirmed a live camera scene with pauses in version 0.4; this update tests steadier frame submission while retaining the 20-fragment session limit. See its [phone instructions](./DisplayTransport-camera-cadence-5-INSTALL.md). It updates the separate test app and keeps Display Access installed.
+The latest experiment is [Display Transport Test: camera framing check 6](./DisplayTransport-camera-framing-6.zip). It corrects the sideways, narrow portrait-phone view and adds live rotation/framing controls while retaining the 20-fragment session limit. Physical improvement remains unverified. See its [phone instructions](./DisplayTransport-camera-framing-6-INSTALL.md). It updates the separate test app and keeps Display Access installed.
 
 ## Diagnostic update
 

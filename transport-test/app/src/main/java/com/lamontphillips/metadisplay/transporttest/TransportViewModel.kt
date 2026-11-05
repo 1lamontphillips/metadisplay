@@ -3,6 +3,7 @@ package com.lamontphillips.metadisplay.transporttest
 import android.Manifest
 import android.app.Activity
 import android.app.Application
+import android.content.Context
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.LinkProperties
@@ -33,6 +34,7 @@ import com.meta.wearable.dat.display.views.VideoPlayer
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.io.IOException
+import java.util.Locale
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
@@ -70,7 +72,9 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
   }
 
   private val app = application
-  private val _state = MutableStateFlow(TransportState())
+  private val cameraViewPreferences = app.getSharedPreferences("camera_view_options", Context.MODE_PRIVATE)
+  private val _state = MutableStateFlow(TransportState(
+      cameraRotationQuarterTurns = loadCameraRotation(), cameraFillFrame = loadCameraFillFrame()))
   val state: StateFlow<TransportState> = _state.asStateFlow()
 
   // All mutable SDK/session state belongs to Main. Server callbacks post onto Main and
@@ -91,6 +95,7 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
   private var configuredTransportReport = "No test configured."
   private var actualTransportReport = "No stream HTTP response observed."
   private var retainedCameraPacing: PhoneCameraProducer.PacingSnapshot? = null
+  private var lastAppliedCameraView = ""
   private val reportStart = SystemClock.elapsedRealtime()
   private val connectivity = app.getSystemService(ConnectivityManager::class.java)
 
@@ -137,6 +142,59 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
         postNetworkRefresh()
     override fun onLinkPropertiesChanged(network: Network, properties: LinkProperties) =
         postNetworkRefresh()
+  }
+
+  private fun loadCameraRotation(): Int = try {
+    Math.floorMod(cameraViewPreferences.getInt("rotationQuarterTurns", 0), 4)
+  } catch (_: Exception) {
+    0
+  }
+
+  private fun loadCameraFillFrame(): Boolean = try {
+    cameraViewPreferences.getBoolean("fillFrame", true)
+  } catch (_: Exception) {
+    true
+  }
+
+  fun rotateCameraView() {
+    viewModelScope.launch {
+      if (cleared) return@launch
+      val rotation = (_state.value.cameraRotationQuarterTurns + 1) % 4
+      _state.value = _state.value.copy(cameraRotationQuarterTurns = rotation)
+      updateRequestedCameraView()
+    }
+  }
+
+  fun toggleCameraFraming() {
+    viewModelScope.launch {
+      if (cleared) return@launch
+      _state.value = _state.value.copy(cameraFillFrame = !_state.value.cameraFillFrame)
+      updateRequestedCameraView()
+    }
+  }
+
+  private fun updateRequestedCameraView() {
+    val options = _state.value
+    try {
+      cameraViewPreferences.edit()
+          .putInt("rotationQuarterTurns", options.cameraRotationQuarterTurns)
+          .putBoolean("fillFrame", options.cameraFillFrame).apply()
+    } catch (_: Exception) {
+      record("Camera view preferences could not be saved; no exception details retained")
+    }
+    record("Requested camera view: extraRotationDegrees=${options.cameraRotationQuarterTurns * 90}, " +
+        "framing=${if (options.cameraFillFrame) "FILL" else "FIT"}")
+    applyRequestedCameraView(activeRun?.cameraProducer)
+  }
+
+  private fun applyRequestedCameraView(producer: PhoneCameraProducer?) {
+    if (producer == null) return
+    val options = _state.value
+    try {
+      producer.setViewOptions(options.cameraRotationQuarterTurns, options.cameraFillFrame)
+    } catch (_: Exception) {
+      record("Camera view options were not applied; no exception details retained")
+    }
   }
 
   fun initialize() {
@@ -287,11 +345,14 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
           cameraEvidence = if (mode == TestMode.LIVE_CAMERA) "Camera starting" else "Camera inactive",
           cameraPacingEvidence = if (mode == TestMode.LIVE_CAMERA)
               "Camera pacing metrics awaiting frames" else "",
+          cameraViewEvidence = if (mode == TestMode.LIVE_CAMERA)
+              "Applied camera geometry awaiting first frame" else "",
           boundedEvidence = if (isBoundedMode(mode))
               "Finite experiment: ${LiveVideoConfig.FRAGMENTS} slots, ${LiveVideoConfig.SLOT_BYTES} bytes each; awaiting initialization."
               else "")
       firstPlaySnapshotReport = "No first SDK PLAYING snapshot captured."
       retainedCameraPacing = null
+      lastAppliedCameraView = ""
       configuredTransportReport = configuredTransport(mode)
       actualTransportReport = "No stream HTTP response observed."
       record("Test ${run.number}: ${mode.name}; " + if (mode == TestMode.LIVE_CAMERA)
@@ -472,6 +533,8 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
             }
           }
           temporaryCamera = camera
+          val viewOptions = _state.value
+          camera.setViewOptions(viewOptions.cameraRotationQuarterTurns, viewOptions.cameraFillFrame)
           camera.start()
         } else {
           val clip = app.assets.open("fragmented.mp4").use { it.readBytes() }
@@ -504,6 +567,9 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
       run.fixtureProducer = temporaryFixture
       run.liveServer = server
       run.streamAssetBytes = buffer.contentLength
+      // Settings may have changed while IO was waiting for initialization. Reapply
+      // the current immutable options after Main takes ownership, without a restart.
+      applyRequestedCameraView(run.cameraProducer)
       temporaryBuffer = null
       temporaryCamera = null
       temporaryFixture = null
@@ -599,7 +665,7 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
         "NO_AVC_ENCODER", "CAMERA_OPEN_FAILED", "CAMERA_CONFIGURE_FAILED", "CAMERA_EGL_FAILED",
         "CAMERA_CODEC_FAILED", "CAMERA_MUXER_FAILED", "CAMERA_INIT_TIMEOUT",
         "CAMERA_FRAME_TIMEOUT", "CAMERA_FRAME_STALLED", "CAMERA_PACING_STALLED",
-        "CAMERA_SLOT_TIMEOUT", "CAMERA_INTERRUPTED",
+        "CAMERA_SLOT_TIMEOUT", "CAMERA_INTERRUPTED", "CAMERA_VIEW_INVALID",
         "CAMERA_CLEANUP_FAILED", "CAMERA_FAILED")
     return if (value in codes) value else "CAMERA_FAILED"
   }
@@ -627,6 +693,9 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
     _state.value = _state.value.copy(cameraEvidence = summary)
     record("Camera $kind: $code; $summary")
     retainCameraPacing(event.pacing)
+    val appliedView = try { run.cameraProducer?.snapshot()?.view ?: event.view }
+        catch (_: Exception) { event.view }
+    retainCameraView(appliedView)
     if (kind in setOf("PROGRESS", "COMPLETE", "FAILED")) {
       record("Camera pacing $kind: ${_state.value.cameraPacingEvidence}")
     }
@@ -655,6 +724,31 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
         snapshot.capturedFrames, snapshot.encodedFrames, snapshot.completedFragments,
         snapshot.width, snapshot.height))
     retainCameraPacing(snapshot.pacing)
+    retainCameraView(snapshot.view)
+  }
+
+  private fun geometryNumber(value: Double): String =
+      if (value.isFinite()) String.format(Locale.ROOT, "%.6g", value) else "unavailable"
+
+  private fun retainCameraView(view: PhoneCameraProducer.ViewSnapshot) {
+    // Empty startup snapshots do not represent a view that has reached the renderer.
+    if (view.captureWidth <= 0 || view.captureHeight <= 0 ||
+        !view.effectiveSourceAspect.isFinite() || view.effectiveSourceAspect <= 0) return
+    val summary = "capture=${view.captureWidth.coerceIn(0, 65535)}x" +
+        "${view.captureHeight.coerceIn(0, 65535)}, output=${LiveVideoConfig.WIDTH}x${LiveVideoConfig.HEIGHT}, " +
+        "sensorOrientationDegrees=${view.sensorOrientationDegrees}, " +
+        "displayRotationDegrees=${view.displayRotationDegrees}, extraRotationDegrees=${view.userRotationDegrees}, " +
+        "framing=${if (view.fillFrame) "FILL" else "FIT"}, " +
+        "surfaceM00=${geometryNumber(view.surfaceM00)}, surfaceM01=${geometryNumber(view.surfaceM01)}, " +
+        "surfaceM10=${geometryNumber(view.surfaceM10)}, surfaceM11=${geometryNumber(view.surfaceM11)}, " +
+        "effectiveSourceAspect=${geometryNumber(view.effectiveSourceAspect)}, " +
+        "cropFractionX=${geometryNumber(view.cropFractionX)}, cropFractionY=${geometryNumber(view.cropFractionY)}, " +
+        "vertexScaleX=${geometryNumber(view.vertexScaleX)}, vertexScaleY=${geometryNumber(view.vertexScaleY)}, " +
+        "surfaceAxesSwapped=${view.surfaceAxesSwapped}"
+    if (summary == lastAppliedCameraView) return
+    lastAppliedCameraView = summary
+    _state.value = _state.value.copy(cameraViewEvidence = summary)
+    record("Applied camera view: $summary")
   }
 
   private fun retainCameraPacing(value: PhoneCameraProducer.PacingSnapshot) {
@@ -1348,7 +1442,7 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
   fun copyReport(): String {
     val snapshot = _state.value
     return buildString {
-      appendLine("MetaDisplay bounded live camera experiment 0.5; SDK 1.0.1")
+      appendLine("MetaDisplay bounded live camera experiment 0.6; SDK 1.0.1")
       appendLine("LIVE_CAMERA uses the phone rear camera only while this app is visible; controls use public fixtures.")
       appendLine("Silent, finite ${LiveVideoConfig.FRAGMENTS}-fragment experiment (roughly 20 seconds), not indefinite streaming.")
       appendLine("Exact response budget: initialization plus ${LiveVideoConfig.FRAGMENTS} valid ${LiveVideoConfig.SLOT_BYTES}-byte fragment slots; no estimated Content-Length.")
@@ -1365,7 +1459,12 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
       appendLine("Cleanup blocked: $cleanupBlocked")
       cleanupBlockReason?.let { appendLine("Cleanup block details: $it") }
       appendLine("Phone HTTP requests: ${snapshot.httpRequests}; bytes: ${snapshot.httpBytes}")
+      appendLine("Requested camera view: extraRotationDegrees=${snapshot.cameraRotationQuarterTurns * 90}, " +
+          "framing=${if (snapshot.cameraFillFrame) "FILL" else "FIT"}; settings persist between tests")
       appendLine("Camera: ${snapshot.cameraEvidence}")
+      if (snapshot.cameraViewEvidence.isNotEmpty()) {
+        appendLine("Applied camera view: ${snapshot.cameraViewEvidence}")
+      }
       if (snapshot.cameraPacingEvidence.isNotEmpty()) {
         appendLine("Camera pacing: ${snapshot.cameraPacingEvidence}")
       }

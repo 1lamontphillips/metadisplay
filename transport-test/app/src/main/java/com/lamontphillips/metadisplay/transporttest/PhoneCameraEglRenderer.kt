@@ -9,7 +9,6 @@ import android.opengl.EGLExt
 import android.opengl.EGLSurface
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
-import android.opengl.Matrix
 import android.os.Handler
 import android.view.Surface
 import java.nio.ByteBuffer
@@ -53,6 +52,20 @@ internal class PhoneCameraEglRenderer(
     private set
   private val textureMatrix = FloatArray(16)
   private val vertexMatrix = FloatArray(16)
+  private val surfaceMatrix = FloatArray(16)
+  private val lastSurfaceMatrix = FloatArray(16)
+  private var geometryDirty = true
+  private var userQuarterTurns = 0
+  private var fillFrame = true
+  private var nextViewSnapshot = PhoneCameraProducer.ViewSnapshot()
+  var appliedViewSnapshot = PhoneCameraProducer.ViewSnapshot()
+    private set
+  private val displayRotationDegrees = when (displayRotation) {
+    Surface.ROTATION_90 -> 90
+    Surface.ROTATION_180 -> 180
+    Surface.ROTATION_270 -> 270
+    else -> 0
+  }
   private val vertices = ByteBuffer.allocateDirect(8 * 4).order(ByteOrder.nativeOrder())
       .asFloatBuffer().apply { put(floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)); position(0) }
   private val coordinates = ByteBuffer.allocateDirect(8 * 4).order(ByteOrder.nativeOrder())
@@ -103,23 +116,6 @@ internal class PhoneCameraEglRenderer(
         frames.incrementAndGet()
         pending.set(true)
       }, callbackHandler)
-      val rotationDegrees = when (displayRotation) {
-        Surface.ROTATION_90 -> 90
-        Surface.ROTATION_180 -> 180
-        Surface.ROTATION_270 -> 270
-        else -> 0
-      }
-      val rotation = (sensorOrientation - rotationDegrees + 360) % 360
-      val sourceAspect = if (rotation == 90 || rotation == 270) {
-        captureHeight.toFloat() / captureWidth
-      } else captureWidth.toFloat() / captureHeight
-      val destinationAspect = width.toFloat() / height
-      Matrix.setIdentityM(vertexMatrix, 0)
-      Matrix.scaleM(vertexMatrix, 0,
-          if (sourceAspect < destinationAspect) sourceAspect / destinationAspect else 1f,
-          if (sourceAspect > destinationAspect) destinationAspect / sourceAspect else 1f, 1f)
-      // Camera sensor orientation is clockwise; GL's positive rotation is counterclockwise.
-      Matrix.rotateM(vertexMatrix, 0, -rotation.toFloat(), 0f, 0f, 1f)
       return Surface(source).also { cameraSurface = it }
     } catch (failure: Exception) {
       try { close() } catch (_: Exception) { /* Producer reports a static failure code. */ }
@@ -127,12 +123,52 @@ internal class PhoneCameraEglRenderer(
     }
   }
 
+  fun setViewOptions(manualQuarterTurns: Int, fillFrame: Boolean) {
+    val normalized = Math.floorMod(manualQuarterTurns, 4)
+    if (userQuarterTurns != normalized || this.fillFrame != fillFrame) {
+      userQuarterTurns = normalized
+      this.fillFrame = fillFrame
+      geometryDirty = true
+    }
+  }
+
+  private fun updateGeometry() {
+    if (!geometryDirty) return
+    val result = CameraViewTransform.calculate(surfaceMatrix, captureWidth, captureHeight,
+        width, height, displayRotationDegrees, userQuarterTurns, fillFrame)
+    result.textureMatrix.copyInto(textureMatrix)
+    result.vertexMatrix.copyInto(vertexMatrix)
+    nextViewSnapshot = PhoneCameraProducer.ViewSnapshot(
+        captureWidth = captureWidth,
+        captureHeight = captureHeight,
+        sensorOrientationDegrees = sensorOrientation,
+        displayRotationDegrees = displayRotationDegrees,
+        userRotationDegrees = userQuarterTurns * 90,
+        fillFrame = fillFrame,
+        surfaceM00 = surfaceMatrix[0].toDouble(),
+        surfaceM01 = surfaceMatrix[4].toDouble(),
+        surfaceM10 = surfaceMatrix[1].toDouble(),
+        surfaceM11 = surfaceMatrix[5].toDouble(),
+        effectiveSourceAspect = result.effectiveSourceAspect,
+        cropFractionX = result.cropFractionX,
+        cropFractionY = result.cropFractionY,
+        vertexScaleX = result.vertexScaleX,
+        vertexScaleY = result.vertexScaleY,
+        surfaceAxesSwapped = result.surfaceAxesSwapped,
+    )
+    geometryDirty = false
+  }
+
   fun renderNextFrame(presentationTimeNs: Long): Boolean {
     val source = checkNotNull(texture) { "CAMERA_EGL_FAILED" }
     var fresh = false
     if (pending.getAndSet(false)) {
       source.updateTexImage()
-      source.getTransformMatrix(textureMatrix)
+      source.getTransformMatrix(surfaceMatrix)
+      if (!surfaceMatrix.contentEquals(lastSurfaceMatrix)) {
+        surfaceMatrix.copyInto(lastSurfaceMatrix)
+        geometryDirty = true
+      }
       val timestamp = source.timestamp
       if (!hasTextureImage || timestamp != lastTextureTimeNs) {
         if (hasTextureImage && timestamp > lastTextureTimeNs) {
@@ -146,6 +182,7 @@ internal class PhoneCameraEglRenderer(
     }
     // Reuse the latest real camera texture between arrivals, never an uninitialized image.
     if (!hasTextureImage) return false
+    updateGeometry()
     GLES20.glViewport(0, 0, width, height)
     GLES20.glClearColor(0f, 0f, 0f, 1f)
     GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
@@ -165,6 +202,7 @@ internal class PhoneCameraEglRenderer(
     check(GLES20.glGetError() == GLES20.GL_NO_ERROR) { "CAMERA_EGL_FAILED" }
     check(EGLExt.eglPresentationTimeANDROID(display, window, presentationTimeNs)) { "CAMERA_EGL_FAILED" }
     check(EGL14.eglSwapBuffers(display, window)) { "CAMERA_EGL_FAILED" }
+    appliedViewSnapshot = nextViewSnapshot
     submittedFrames++
     if (!fresh) repeatedFrames++
     return true

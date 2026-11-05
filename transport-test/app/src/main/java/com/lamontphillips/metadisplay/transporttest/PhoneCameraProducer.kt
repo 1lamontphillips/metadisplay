@@ -42,6 +42,25 @@ class PhoneCameraProducer(
     private val displayRotation: Int,
     private val listener: Consumer<Event>,
 ) : AutoCloseable {
+  data class ViewSnapshot(
+      val captureWidth: Int = 0,
+      val captureHeight: Int = 0,
+      val sensorOrientationDegrees: Int = 0,
+      val displayRotationDegrees: Int = 0,
+      val userRotationDegrees: Int = 0,
+      val fillFrame: Boolean = true,
+      val surfaceM00: Double = 0.0,
+      val surfaceM01: Double = 0.0,
+      val surfaceM10: Double = 0.0,
+      val surfaceM11: Double = 0.0,
+      val effectiveSourceAspect: Double = 0.0,
+      val cropFractionX: Double = 1.0,
+      val cropFractionY: Double = 1.0,
+      val vertexScaleX: Double = 1.0,
+      val vertexScaleY: Double = 1.0,
+      val surfaceAxesSwapped: Boolean = false,
+  )
+
   data class PacingSnapshot(
       val submittedFrames: Long = 0,
       val freshTextureUpdates: Long = 0,
@@ -66,6 +85,7 @@ class PhoneCameraProducer(
       val width: Int,
       val height: Int,
       val pacing: PacingSnapshot = PacingSnapshot(),
+      val view: ViewSnapshot = ViewSnapshot(),
   )
 
   data class Snapshot(
@@ -76,6 +96,7 @@ class PhoneCameraProducer(
       val width: Int,
       val height: Int,
       val pacing: PacingSnapshot = PacingSnapshot(),
+      val view: ViewSnapshot = ViewSnapshot(),
   )
 
   private companion object {
@@ -99,6 +120,7 @@ class PhoneCameraProducer(
   )
 
   private data class EncoderChoice(val codec: MediaCodec, val surface: Surface)
+  private data class ViewOptions(val quarterTurns: Int = 0, val fillFrame: Boolean = true)
 
   private class PacingTimings {
     var maxRenderWorkNs = 0L
@@ -120,6 +142,8 @@ class PhoneCameraProducer(
   private val encoded = AtomicLong()
   private val completed = AtomicInteger()
   private val pacing = AtomicReference(PacingSnapshot())
+  private val view = AtomicReference(ViewSnapshot())
+  private val viewOptions = AtomicReference(ViewOptions())
   private val asynchronousFailure = AtomicReference<String?>(null)
   private val camera = AtomicReference<CameraDevice?>(null)
   private val cameraSession = AtomicReference<CameraCaptureSession?>(null)
@@ -142,13 +166,18 @@ class PhoneCameraProducer(
   }
 
   fun snapshot(): Snapshot = Snapshot(status.get(), captured.get(), encoded.get(), completed.get(),
-      LiveVideoConfig.WIDTH, LiveVideoConfig.HEIGHT, pacing.get())
+      LiveVideoConfig.WIDTH, LiveVideoConfig.HEIGHT, pacing.get(), view.get())
+
+  /** Changes composition at the next draw tick, without touching camera/session timing. */
+  fun setViewOptions(manualQuarterTurns: Int, fillFrame: Boolean) {
+    viewOptions.set(ViewOptions(Math.floorMod(manualQuarterTurns, 4), fillFrame))
+  }
 
   private fun event(kind: String, code: String) {
     val value = snapshot()
     try {
       listener.accept(Event(kind, code, value.capturedFrames, value.encodedFrames,
-          value.completedFragments, value.width, value.height, value.pacing))
+          value.completedFragments, value.width, value.height, value.pacing, value.view))
     } catch (_: RuntimeException) {
       // The caller's UI callback cannot interrupt camera cleanup or expose frame data.
     }
@@ -159,6 +188,7 @@ class PhoneCameraProducer(
       pacer: CameraFramePacer,
       timings: PacingTimings,
   ) {
+    renderer?.let { view.set(it.appliedViewSnapshot) }
     pacing.set(PacingSnapshot(
         submittedFrames = renderer?.submittedFrames ?: 0,
         freshTextureUpdates = renderer?.freshTextureUpdates ?: 0,
@@ -286,7 +316,11 @@ class PhoneCameraProducer(
           if (tick.stalled) throw CameraFailure("CAMERA_PACING_STALLED")
           val renderBegan = System.nanoTime()
           try {
+            val options = viewOptions.get()
+            renderer.setViewOptions(options.quarterTurns, options.fillFrame)
             renderer.renderNextFrame(tick.presentationTimeNs)
+          } catch (_: CameraViewTransform.InvalidTransformException) {
+            throw CameraFailure("CAMERA_VIEW_INVALID")
           } finally {
             timings.maxRenderWorkNs = maxOf(timings.maxRenderWorkNs, System.nanoTime() - renderBegan)
           }
