@@ -4,6 +4,10 @@ enum class TestMode {
   REFERENCE,
   LOOPBACK,
   WIFI,
+  STREAM_CONTROL,
+  FRAGMENTED_FILE,
+  PACED_FILE,
+  PACED_CHUNKED,
 }
 
 data class TransportState(
@@ -19,5 +23,6 @@ data class TransportState(
     val lastError: String? = null,
     val httpRequests: Int = 0,
     val httpBytes: Long = 0,
+    val streamEvidence: String = "No first-PLAYING evidence yet",
     val events: List<String> = emptyList(),
 )

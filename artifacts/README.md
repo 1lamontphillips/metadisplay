@@ -1,6 +1,6 @@
 # Display Access Android sample
 
-The next experiment is a separate [Display Transport Test](./DisplayTransport-test-1.zip), which checks phone-hosted finite MP4 reachability without replacing this working sample. See its [phone instructions](./DisplayTransport-test-1-INSTALL.md).
+The latest experiment is [Display Transport Test: streaming check 2](./DisplayTransport-stream-check-2.zip). Phone-hosted finite MP4 playback has been confirmed in the glasses; this update checks whether playback can begin before all video bytes arrive. See its [phone instructions](./DisplayTransport-stream-check-2-INSTALL.md). It updates the separate test app and keeps Display Access installed.
 
 ## Diagnostic update
 
@@ -23,7 +23,7 @@ This package contains the debug-signed APK built from [Meta's official DisplayAc
 5. Open **Display Access**, grant Nearby devices/Bluetooth permission, tap **Connect my glasses**, and complete registration until the sample reports **Registered**.
 6. Open **Samples → Car maintenance guide → Try it**. In the glasses, select **Oil change → Start** and confirm the instructions appear. Test **Next** and **Previous**.
 
-The APK was built successfully and its Android debug signature verified. Installation, physical glasses connectivity, and visible content still require testing on the paired phone and glasses. Simulated previews do not establish physical device support.
+The APK was built successfully and its Android debug signature verified. The user has since confirmed repeated video playback in physical glasses. That finite sample playback does not establish support for a continuous phone-camera stream.
 
 Developer Mode uses Meta's documented development application ID and client token values of `0`. No production credentials are included.
 

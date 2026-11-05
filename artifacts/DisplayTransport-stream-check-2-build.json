@@ -1,0 +1,19 @@
+{
+  "application_id": "com.lamontphillips.metadisplay.transporttest",
+  "version_code": 2,
+  "version": "0.2-stream-check",
+  "sdk": "1.0.1",
+  "apk_sha256": "fa15ecbd722ce7bd6c44e08f6769fc7ac0bc0af4464752e166c965c48dc38efa",
+  "zip_sha256": "cbf15cf29f1101f1a522e60ab5db8c63cd648ab142fb0d0a30c0bc42e3acaa65",
+  "zip_bytes": 21737393,
+  "checks": {
+    "http_protocol_cases": "66 passed,0failed (39 original+27 streaming)",
+    "debug_build": "passed",
+    "lint": "0errors,3warnings (pinned tool updates and intentional test HTTP)",
+    "apk_signature": "verified, same as transport-test1",
+    "fixtures": "480 identical encoded video packets across control/fragmented containers;20s,266x150,24fps",
+    "real_media_integration": "ffmpeg decoded480 frames through paced chunked server; first output at261ms with12288/313014bytes written and incomplete payload/response",
+    "camera_permission": "absent"
+  },
+  "limits": "Meta glasses progressive playback and live camera capture remain unverified; standard decoder test is not device proof."
+}
