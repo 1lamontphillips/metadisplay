@@ -18,6 +18,7 @@ import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
 
@@ -60,6 +61,14 @@ public final class LiveClipHttpServerTest {
     tests.add(new NamedCase("HEAD does not replace GET snapshot", LiveClipHttpServerTest::headPreserves));
     tests.add(new NamedCase("throwing listener does not interrupt transfer", LiveClipHttpServerTest::throwingListener));
     tests.add(new NamedCase("worker callback can stop; external close confirms joins", LiveClipHttpServerTest::closeFromCallback));
+    tests.add(new NamedCase("legacy constructor retains 75-second response budget", LiveClipHttpServerTest::defaultDeadline));
+    tests.add(new NamedCase("selected response deadlines are validated", LiveClipHttpServerTest::deadlineValidation));
+    tests.add(new NamedCase("short whole-response deadline closes a waiting body", LiveClipHttpServerTest::waitingDeadline));
+    tests.add(new NamedCase("whole-response deadline does not reset on ongoing production", LiveClipHttpServerTest::progressingDeadline));
+    tests.add(new NamedCase("one-minute quota streams sixty exact future slots", LiveClipHttpServerTest::minuteGet));
+    tests.add(new NamedCase("one-minute quota supports a cross-slot range", LiveClipHttpServerTest::minuteRange));
+    tests.add(new NamedCase("one-minute quota waits for a future tail range", LiveClipHttpServerTest::minuteFutureTail));
+    tests.add(new NamedCase("one-minute waiting source remains cancelable", LiveClipHttpServerTest::minuteStop));
     int failed = 0;
     for (NamedCase test : tests) {
       try {
@@ -375,6 +384,249 @@ public final class LiveClipHttpServerTest {
       }
       server.close();
       check(!server.isRunning(), "callback/external stop confirmed");
+    }
+  }
+
+  private static void defaultDeadline() throws Exception {
+    try (Fixture fixture = new Fixture(false)) {
+      equal(LiveSessionPlan.SHORT.getHttpResponseLimitMs(), fixture.server.getResponseLimitMs(),
+          "legacy constructor uses the baseline response deadline");
+      try (Client head = fixture.request("HEAD", "")) {
+        headers(head, 200, TOTAL);
+        head.expectEof();
+      }
+    }
+  }
+
+  private static void deadlineValidation() throws Exception {
+    try (BoundedMediaBuffer source = source(false)) {
+      InetAddress address = InetAddress.getByAddress(new byte[] {127, 0, 0, 1});
+      for (long invalid : new long[] {Long.MIN_VALUE, -1, 0, 180001, Long.MAX_VALUE}) {
+        try {
+          new LiveClipHttpServer(source, address, invalid, event -> {});
+          throw new AssertionError("invalid deadline accepted: " + invalid);
+        } catch (IllegalArgumentException expected) { }
+      }
+      for (long accepted : new long[] {1, 75000, 150000, 180000}) {
+        try (LiveClipHttpServer server = new LiveClipHttpServer(source, address, accepted, event -> {})) {
+          equal(accepted, server.getResponseLimitMs(), "selected bounded deadline retained");
+        }
+      }
+    }
+  }
+
+  private static void waitingDeadline() throws Exception {
+    BlockingQueue<LiveClipHttpServer.Event> events = new LinkedBlockingQueue<>();
+    try (BoundedMediaBuffer source = source(false);
+        LiveClipHttpServer server = new LiveClipHttpServer(source,
+            InetAddress.getByAddress(new byte[] {127, 0, 0, 1}), 120, events::add)) {
+      server.start();
+      long begun = System.nanoTime();
+      try (Client client = request(server, "GET", "")) {
+        headers(client, 200, TOTAL);
+        equalBytes(INIT, client.readFixed(INIT.length), "init before finite deadline");
+        client.expectEof();
+      }
+      check(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - begun) < 1800,
+          "selected short deadline must close instead of waiting for the 75-second baseline");
+      LiveClipHttpServer.Event complete = completeEvent(events);
+      equal("source_timeout", complete.outcome, "deadline safe outcome");
+      equal(INIT.length, complete.bytesSent, "partial response byte count");
+      LiveClipHttpServer.TransferSnapshot snapshot = server.getTransferSnapshot();
+      check(!snapshot.payloadComplete && !snapshot.responseComplete, "deadline cannot appear complete");
+      equal(0, snapshot.activeGetCount, "deadline releases the worker");
+      check(!source.isClosed(), "HTTP deadline does not own the source");
+    }
+  }
+
+  private static void progressingDeadline() throws Exception {
+    LiveSessionPlan plan = LiveSessionPlan.ONE_MINUTE;
+    BlockingQueue<LiveClipHttpServer.Event> events = new LinkedBlockingQueue<>();
+    try (BoundedMediaBuffer source = new BoundedMediaBuffer(plan.getFragmentCount(), plan.getSlotBytes());
+        LiveClipHttpServer server = new LiveClipHttpServer(source,
+            InetAddress.getByAddress(new byte[] {127, 0, 0, 1}), 220, events::add)) {
+      source.onInitialization(INIT);
+      server.start();
+      try (Client client = request(server, "GET", "");
+          SyntheticProducer producer = new SyntheticProducer(source, 60, 65536, 30)) {
+        equal(INIT.length + plan.getSlotPayloadBytes(), Long.parseLong(client.header("content-length")),
+            "honest full length while a shorter response deadline is tested");
+        long begun = System.nanoTime();
+        producer.start();
+        byte[] partial = client.input.readAllBytes();
+        check(partial.length > INIT.length, "production kept advancing during response");
+        check(partial.length < INIT.length + plan.getSlotPayloadBytes(), "body stopped before full production");
+        check(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - begun) < 1800,
+            "progress must not extend the whole-response budget");
+        LiveClipHttpServer.Event complete = completeEvent(events);
+        equal("source_timeout", complete.outcome, "absolute deadline under progress");
+        check(!server.getTransferSnapshot().responseComplete, "advancing source still aborted incomplete");
+      }
+    }
+  }
+
+  private static void minuteGet() throws Exception {
+    LiveSessionPlan plan = LiveSessionPlan.ONE_MINUTE;
+    int total = Math.toIntExact(INIT.length + plan.getSlotPayloadBytes());
+    try (BoundedMediaBuffer source = new BoundedMediaBuffer(plan.getFragmentCount(), plan.getSlotBytes());
+        LiveClipHttpServer server = minuteServer(source)) {
+      source.onInitialization(INIT);
+      server.start();
+      try (Client client = request(server, "GET", "");
+          SyntheticProducer producer = new SyntheticProducer(source, plan.getFragmentCount(), plan.getSlotBytes(), 2)) {
+        headers(client, 200, total);
+        equal(150000, server.getResponseLimitMs(), "one-minute response deadline selected");
+        equalBytes(INIT, client.readFixed(INIT.length), "init arrives before sixty future slots");
+        client.expectWaiting();
+        producer.start();
+        byte[] body = client.readFixed(total - INIT.length);
+        client.expectEof();
+        producer.awaitSuccess();
+        for (int slot = 0; slot < plan.getFragmentCount(); slot++) {
+          equalBytes(bytes(plan.getSlotBytes(), slot + 1),
+              Arrays.copyOfRange(body, slot * plan.getSlotBytes(), (slot + 1) * plan.getSlotBytes()),
+              "exact sixty-slot payload at " + slot);
+        }
+        LiveClipHttpServer.TransferSnapshot done = awaitSnapshot(server,
+            value -> value.responseComplete && value.activeGetCount == 0);
+        equal(total, done.bytesSent, "one-minute exact transmitted length");
+        equal(total, done.sourceBytesProduced, "one-minute full production sampled");
+        equal(60, source.getCompletedSlots(), "sixty slots complete");
+        check(source.isComplete() && done.payloadComplete, "one continuous planned response completed");
+      }
+    }
+  }
+
+  private static void minuteRange() throws Exception {
+    LiveSessionPlan plan = LiveSessionPlan.ONE_MINUTE;
+    try (BoundedMediaBuffer source = new BoundedMediaBuffer(plan.getFragmentCount(), plan.getSlotBytes());
+        LiveClipHttpServer server = minuteServer(source)) {
+      source.onInitialization(INIT);
+      for (int slot = 0; slot < plan.getFragmentCount(); slot++) source.onFragment(bytes(plan.getSlotBytes(), slot + 1));
+      source.onComplete();
+      server.start();
+      int start = INIT.length + 58 * plan.getSlotBytes() + plan.getSlotBytes() - 9;
+      int end = start + 25;
+      try (Client client = request(server, "GET", "Range: bytes=" + start + "-" + end + "\r\n")) {
+        headers(client, 206, end - start + 1);
+        equal("bytes " + start + "-" + end + "/" + source.getContentLength(),
+            client.header("content-range"), "cross-slot range retains the full truthful size");
+        byte[] expected = new byte[26];
+        for (int i = 0; i < expected.length; i++) expected[i] = minuteByte(start + i, plan.getSlotBytes());
+        equalBytes(expected, client.readFixed(expected.length), "range crosses slots59/60 exactly");
+        client.expectEof();
+      }
+    }
+  }
+
+  private static void minuteFutureTail() throws Exception {
+    LiveSessionPlan plan = LiveSessionPlan.ONE_MINUTE;
+    try (BoundedMediaBuffer source = new BoundedMediaBuffer(plan.getFragmentCount(), plan.getSlotBytes());
+        LiveClipHttpServer server = minuteServer(source)) {
+      source.onInitialization(INIT);
+      server.start();
+      int total = Math.toIntExact(source.getContentLength());
+      try (Client client = request(server, "GET", "Range: bytes=" + (total - 17) + "-\r\n");
+          SyntheticProducer producer = new SyntheticProducer(source, plan.getFragmentCount(), plan.getSlotBytes(), 2)) {
+        headers(client, 206, 17);
+        client.expectWaiting();
+        producer.start();
+        byte[] expected = new byte[17];
+        for (int i = 0; i < expected.length; i++) expected[i] = minuteByte(total - 17 + i, plan.getSlotBytes());
+        equalBytes(expected, client.readFixed(17), "future tail waited for all sixty production slots");
+        client.expectEof();
+        producer.awaitSuccess();
+        LiveClipHttpServer.TransferSnapshot done = awaitSnapshot(server, value -> value.responseComplete);
+        equal(17, done.bytesSent, "tail byte count is not the entire media length");
+        equal(total, done.sourceBytesProduced, "source retains actual production separately");
+      }
+    }
+  }
+
+  private static void minuteStop() throws Exception {
+    LiveSessionPlan plan = LiveSessionPlan.ONE_MINUTE;
+    try (BoundedMediaBuffer source = new BoundedMediaBuffer(plan.getFragmentCount(), plan.getSlotBytes());
+        LiveClipHttpServer server = minuteServer(source)) {
+      source.onInitialization(INIT);
+      server.start();
+      try (Client client = request(server, "GET", "")) {
+        client.readFixed(INIT.length);
+        long begun = System.nanoTime();
+        server.close();
+        check(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - begun) < 2500,
+            "selected150-second budget does not lengthen Stop");
+        client.expectEof();
+        check(!source.isClosed() && !server.getTransferSnapshot().responseComplete,
+            "stopped source remains caller-owned and incomplete");
+      }
+    }
+  }
+
+  private static byte minuteByte(int offset, int slotBytes) {
+    if (offset < INIT.length) return INIT[offset];
+    int position = offset - INIT.length;
+    return (byte) ((position % slotBytes) * 31 + position / slotBytes + 1);
+  }
+
+  private static Client request(LiveClipHttpServer server, String method, String extraHeaders) throws Exception {
+    return new Client(server, method + " " + server.getPath() + " HTTP/1.1\r\n" + extraHeaders + "\r\n");
+  }
+
+  private static LiveClipHttpServer minuteServer(BoundedMediaBuffer source) throws Exception {
+    return new LiveClipHttpServer(source, InetAddress.getByAddress(new byte[] {127, 0, 0, 1}),
+        LiveSessionPlan.ONE_MINUTE.getHttpResponseLimitMs(), event -> {});
+  }
+
+  private static LiveClipHttpServer.TransferSnapshot awaitSnapshot(LiveClipHttpServer server,
+      Predicate<LiveClipHttpServer.TransferSnapshot> predicate) throws Exception {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    while (System.nanoTime() < deadline) {
+      LiveClipHttpServer.TransferSnapshot value = server.getTransferSnapshot();
+      if (predicate.test(value)) return value;
+      Thread.sleep(5);
+    }
+    throw new AssertionError("snapshot condition not observed");
+  }
+
+  private static LiveClipHttpServer.Event completeEvent(BlockingQueue<LiveClipHttpServer.Event> events)
+      throws Exception {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+    while (System.nanoTime() < deadline) {
+      LiveClipHttpServer.Event event = events.poll(100, TimeUnit.MILLISECONDS);
+      if (event != null && event.phase == LiveClipHttpServer.Phase.COMPLETE) return event;
+    }
+    throw new AssertionError("terminal response event missing");
+  }
+
+  private static final class SyntheticProducer implements AutoCloseable {
+    private final AtomicBoolean running = new AtomicBoolean(true);
+    private final AtomicReference<Throwable> failure = new AtomicReference<>();
+    private final Thread thread;
+    SyntheticProducer(BoundedMediaBuffer source, int slots, int slotBytes, long cadenceMs) {
+      thread = new Thread(() -> {
+        try {
+          for (int slot = 0; slot < slots && running.get(); slot++) {
+            Thread.sleep(cadenceMs);
+            if (!running.get()) return;
+            source.onFragment(bytes(slotBytes, slot + 1));
+          }
+          if (running.get()) source.onComplete();
+        } catch (Throwable problem) {
+          if (running.get()) failure.set(problem);
+        }
+      }, "minute-synthetic-producer");
+    }
+    void start() { thread.start(); }
+    void awaitSuccess() throws Exception {
+      thread.join(4000);
+      check(!thread.isAlive(), "fast synthetic producer finished");
+      if (failure.get() != null) throw new AssertionError("synthetic producer failed", failure.get());
+    }
+    @Override public void close() throws Exception {
+      running.set(false);
+      thread.interrupt();
+      thread.join(2000);
+      check(!thread.isAlive(), "synthetic producer cleanup bounded");
     }
   }
 

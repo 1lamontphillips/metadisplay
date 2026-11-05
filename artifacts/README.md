@@ -1,6 +1,6 @@
 # Display Access Android sample
 
-The latest experiment is [Display Transport Test: camera framing check 6](./DisplayTransport-camera-framing-6.zip). It corrects the sideways, narrow portrait-phone view and adds live rotation/framing controls while retaining the 20-fragment session limit. Physical improvement remains unverified. See its [phone instructions](./DisplayTransport-camera-framing-6-INSTALL.md). It updates the separate test app and keeps Display Access installed.
+The latest experiment is [Display Transport Test: one-minute camera 7](./DisplayTransport-one-minute-7.zip). Version 0.6 was confirmed smooth and readable; this adds a continuous 60-fragment run while preserving the 20-fragment camera/control baselines. The longer run needs device validation. See its [phone instructions](./DisplayTransport-one-minute-7-INSTALL.md). It updates the separate test app and keeps Display Access installed.
 
 ## Diagnostic update
 

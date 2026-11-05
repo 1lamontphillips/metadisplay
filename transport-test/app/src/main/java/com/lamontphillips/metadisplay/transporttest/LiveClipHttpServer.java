@@ -34,6 +34,8 @@ public final class LiveClipHttpServer implements AutoCloseable {
   private static final int MAX_HEADERS = 64;
   private static final int WORKER_COUNT = 4;
   private static final int QUEUE_SIZE = 8;
+  private static final long DEFAULT_RESPONSE_LIMIT_MS = 75000;
+  private static final long MAX_RESPONSE_LIMIT_MS = 180000;
 
   public enum Phase { STARTED, PROGRESS, COMPLETE }
 
@@ -114,6 +116,7 @@ public final class LiveClipHttpServer implements AutoCloseable {
   }
 
   private final BoundedMediaBuffer source;
+  private final long responseLimitMs;
   private final AtomicLong maximumProducedBytes = new AtomicLong();
   private final InetAddress bindAddress;
   private final Object transfers = new Object();
@@ -139,9 +142,19 @@ public final class LiveClipHttpServer implements AutoCloseable {
   /** Listener callbacks can occur concurrently on server threads and must return promptly. */
   public LiveClipHttpServer(BoundedMediaBuffer source, InetAddress bindAddress,
       Consumer<Event> listener) {
+    this(source, bindAddress, DEFAULT_RESPONSE_LIMIT_MS, listener);
+  }
+
+  /** One finite response may wait for production only within this bounded deadline. */
+  public LiveClipHttpServer(BoundedMediaBuffer source, InetAddress bindAddress,
+      long responseLimitMs, Consumer<Event> listener) {
     this.source = Objects.requireNonNull(source, "source");
     this.bindAddress = Objects.requireNonNull(bindAddress, "bindAddress");
     this.listener = Objects.requireNonNull(listener, "listener");
+    if (responseLimitMs < 1 || responseLimitMs > MAX_RESPONSE_LIMIT_MS) {
+      throw new IllegalArgumentException("Invalid finite response deadline");
+    }
+    this.responseLimitMs = responseLimitMs;
     if (!bindAddress.isLoopbackAddress()) {
       throw new IllegalArgumentException("Loopback binding required");
     }
@@ -196,6 +209,7 @@ public final class LiveClipHttpServer implements AutoCloseable {
   }
 
   public int getPort() { return port; }
+  public long getResponseLimitMs() { return responseLimitMs; }
   public String getPath() { return path; }
   public boolean isRunning() { return running.get(); }
   /** Parsed asset GET/HEAD requests, including unsatisfiable ranges; excludes malformed requests. */
@@ -379,14 +393,18 @@ public final class LiveClipHttpServer implements AutoCloseable {
     byte[] chunk = new byte[16384];
     long lastData = System.nanoTime();
     long lastProduced = producedBytes();
-    long deadline = lastData + TimeUnit.SECONDS.toNanos(75);
+    long responseStarted = lastData;
+    long responseBudgetNs = TimeUnit.MILLISECONDS.toNanos(responseLimitMs);
     while (remaining > 0) {
       ensureServing();
       long now = System.nanoTime();
-      if (now >= deadline) throw new SocketTimeoutException("Response deadline");
+      long responseRemainingNs = responseBudgetNs - (now - responseStarted);
+      if (responseRemainingNs <= 0) throw new SocketTimeoutException("Response deadline");
+      long waitMs = Math.max(1L, Math.min(500L,
+          (responseRemainingNs + 999999L) / 1000000L));
       int amount;
       try {
-        amount = source.readAt(offset, chunk, 0, (int) Math.min(chunk.length, remaining), 500);
+        amount = source.readAt(offset, chunk, 0, (int) Math.min(chunk.length, remaining), waitMs);
       } catch (SocketTimeoutException waiting) {
         // A seek to a future byte can legitimately wait while earlier fragments are
         // still being produced. Treat source progress as activity, with the same
@@ -402,6 +420,9 @@ public final class LiveClipHttpServer implements AutoCloseable {
       }
       if (amount <= 0) throw new IOException("Incomplete media source");
       ensureServing();
+      if (System.nanoTime() - responseStarted >= responseBudgetNs) {
+        throw new SocketTimeoutException("Response deadline");
+      }
       request.writeInProgress = true;
       updateTransfer(request, false);
       output.write(chunk, 0, amount);

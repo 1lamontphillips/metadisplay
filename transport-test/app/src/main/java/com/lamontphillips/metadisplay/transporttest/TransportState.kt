@@ -15,6 +15,7 @@ enum class TestMode {
   KNOWN_LENGTH_NO_RANGES,
   PADDED_CONTROL,
   LIVE_CAMERA,
+  LIVE_CAMERA_60,
 }
 
 data class TransportState(

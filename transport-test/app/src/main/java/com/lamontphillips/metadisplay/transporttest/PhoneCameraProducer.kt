@@ -34,12 +34,13 @@ import java.util.concurrent.locks.LockSupport
 import java.util.function.Consumer
 import kotlin.math.abs
 
-/** Foreground-only, silent rear-camera experiment with an exact twenty-slot response budget. */
+/** Foreground-only, silent rear-camera experiment with one exact, finite response budget. */
 @SuppressLint("UnsafeOptInUsageError")
 class PhoneCameraProducer(
     context: Context,
     private val buffer: BoundedMediaBuffer,
     private val displayRotation: Int,
+    private val sessionPlan: LiveSessionPlan = LiveSessionPlan.SHORT,
     private val listener: Consumer<Event>,
 ) : AutoCloseable {
   data class ViewSnapshot(
@@ -86,6 +87,9 @@ class PhoneCameraProducer(
       val height: Int,
       val pacing: PacingSnapshot = PacingSnapshot(),
       val view: ViewSnapshot = ViewSnapshot(),
+      val fragmentLimit: Int = LiveVideoConfig.FRAGMENTS,
+      val slotBytes: Int = LiveVideoConfig.SLOT_BYTES,
+      val captureLimitMs: Long = 35_000L,
   )
 
   data class Snapshot(
@@ -97,6 +101,9 @@ class PhoneCameraProducer(
       val height: Int,
       val pacing: PacingSnapshot = PacingSnapshot(),
       val view: ViewSnapshot = ViewSnapshot(),
+      val fragmentLimit: Int = LiveVideoConfig.FRAGMENTS,
+      val slotBytes: Int = LiveVideoConfig.SLOT_BYTES,
+      val captureLimitMs: Long = 35_000L,
   )
 
   private companion object {
@@ -106,8 +113,12 @@ class PhoneCameraProducer(
     const val FRAME_TIMEOUT_NS = 2_000_000_000L
     const val INIT_TIMEOUT_NS = 4_000_000_000L
     const val FRAGMENT_TIMEOUT_NS = 5_000_000_000L
-    const val TOTAL_TIMEOUT_NS = 35_000_000_000L
     const val PACING_STALL_NS = 500_000_000L
+  }
+
+  init {
+    // Reject inconsistent producer/cache quotas before starting any camera work.
+    sessionPlan.validateBuffer(buffer)
   }
 
   private class CameraFailure(val code: String) : RuntimeException(code)
@@ -166,7 +177,8 @@ class PhoneCameraProducer(
   }
 
   fun snapshot(): Snapshot = Snapshot(status.get(), captured.get(), encoded.get(), completed.get(),
-      LiveVideoConfig.WIDTH, LiveVideoConfig.HEIGHT, pacing.get(), view.get())
+      LiveVideoConfig.WIDTH, LiveVideoConfig.HEIGHT, pacing.get(), view.get(),
+      sessionPlan.fragmentCount, sessionPlan.slotBytes, sessionPlan.captureLimitMs)
 
   /** Changes composition at the next draw tick, without touching camera/session timing. */
   fun setViewOptions(manualQuarterTurns: Int, fillFrame: Boolean) {
@@ -177,7 +189,8 @@ class PhoneCameraProducer(
     val value = snapshot()
     try {
       listener.accept(Event(kind, code, value.capturedFrames, value.encodedFrames,
-          value.completedFragments, value.width, value.height, value.pacing, value.view))
+          value.completedFragments, value.width, value.height, value.pacing, value.view,
+          value.fragmentLimit, value.slotBytes, value.captureLimitMs))
     } catch (_: RuntimeException) {
       // The caller's UI callback cannot interrupt camera cleanup or expose frame data.
     }
@@ -224,6 +237,7 @@ class PhoneCameraProducer(
     var encoderStarted = false
     val pacer = CameraFramePacer(LiveVideoConfig.FPS, PACING_STALL_NS)
     val timings = PacingTimings()
+    val captureLimitNs = TimeUnit.MILLISECONDS.toNanos(sessionPlan.captureLimitMs)
     var stage = "CAMERA_FAILED"
     try {
       if (stopping.get()) return
@@ -248,7 +262,7 @@ class PhoneCameraProducer(
           displayRotation, callbackHandler)
       val cameraInput = renderer.initialize()
       stage = "CAMERA_MUXER_FAILED"
-      val activeParser = FixedBudgetMp4(LiveVideoConfig.FRAGMENTS, LiveVideoConfig.SLOT_BYTES, buffer)
+      val activeParser = FixedBudgetMp4(sessionPlan.fragmentCount, sessionPlan.slotBytes, buffer)
       parser = activeParser
       muxer = FragmentedMp4Muxer.Builder(activeParser).setFragmentDurationMs(500)
           .setSampleCopyingEnabled(true).build()
@@ -304,7 +318,7 @@ class PhoneCameraProducer(
         }
         if (now - lastFrame > FRAME_TIMEOUT_NS) throw CameraFailure("CAMERA_FRAME_STALLED")
         if (now - began > INIT_TIMEOUT_NS && track < 0) throw CameraFailure("CAMERA_INIT_TIMEOUT")
-        if (now - lastFragment > FRAGMENT_TIMEOUT_NS || now - began > TOTAL_TIMEOUT_NS) {
+        if (now - lastFragment > FRAGMENT_TIMEOUT_NS || now - began > captureLimitNs) {
           throw CameraFailure("CAMERA_SLOT_TIMEOUT")
         }
         stage = "CAMERA_EGL_FAILED"

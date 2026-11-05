@@ -152,9 +152,9 @@ private fun TransportScreen(
     ) {
       Text("Display Transport Test", style = MaterialTheme.typography.headlineMedium,
           fontWeight = FontWeight.Bold)
-      Text("Camera view check", style = MaterialTheme.typography.titleMedium)
+      Text("Live camera sessions", style = MaterialTheme.typography.titleMedium)
       Text(
-          "Use Fill frame for a larger picture and Rotate 90° if needed. Each test ends after 20 video fragments, about 20 seconds. Keep this app open.",
+          "Choose a one-minute camera session or a quick 20-second check. Keep this app open. Your rotation and framing choices are remembered.",
           style = MaterialTheme.typography.bodyLarge,
       )
       Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
@@ -179,14 +179,18 @@ private fun TransportScreen(
         }
       }
       SourceCard(
-          title = "1 · Bounded video control",
-          description = "Play silent test footage with the same fixed byte budget planned for the camera. Check that the picture moves smoothly in your glasses.",
-          button = "Play bounded control",
+          title = "1 · One-minute live camera",
+          description = if (cameraPermissionGranted) {
+            "Use the rear camera continuously for 60 video fragments, about one minute. Keep the glasses on and this app open until the session finishes."
+          } else {
+            "Allow Camera access, then tap Start one-minute camera. Capture stops when the session ends, you tap Stop, or this app leaves the foreground."
+          },
+          button = if (cameraPermissionGranted) "Start one-minute camera" else "Allow camera for one-minute test",
           enabled = state.canStart && !state.busy,
-          onClick = { onStart(TestMode.PADDED_CONTROL) },
+          onClick = { if (cameraPermissionGranted) onStart(TestMode.LIVE_CAMERA_60) else onCameraPermission() },
       )
       SourceCard(
-          title = "2 · Live phone camera",
+          title = "2 · Quick live check",
           description = if (cameraPermissionGranted) {
             "Point the rear camera at a clock or moving object. Start the test and check your glasses. Silent video; no recording file is saved."
           } else {
@@ -220,6 +224,13 @@ private fun TransportScreen(
         Text(if (showBaseline) "Hide earlier transport tests" else "Show earlier transport tests")
       }
       if (showBaseline) {
+        SourceCard(
+            title = "20-second bounded video control",
+            description = "Play the existing silent public footage through its original 20-fragment budget.",
+            button = "Play bounded control",
+            enabled = state.canStart && !state.busy,
+            onClick = { onStart(TestMode.PADDED_CONTROL) },
+        )
         SourceCard(
             title = "Known length without ranges",
             description = "Compare the successful gradual clip while disabling byte ranges. This checks the remaining difference from the failed unknown-length tests.",

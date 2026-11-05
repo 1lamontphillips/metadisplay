@@ -69,6 +69,9 @@ public final class BoundedMediaBuffer implements FixedBudgetMp4.Sink, AutoClosea
   }
 
   public synchronized long getContentLength() { return contentLength; }
+  /** Immutable quotas are available before initialization and after cleanup. */
+  public int getSlotCount() { return slotCount; }
+  public int getSlotBytes() { return slotBytes; }
   public synchronized long getProducedBytes() { return produced; }
   public synchronized int getCompletedSlots() { return completedSlots; }
   public synchronized boolean isComplete() { return complete; }

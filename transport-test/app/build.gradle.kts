@@ -13,8 +13,8 @@ android {
     applicationId = "com.lamontphillips.metadisplay.transporttest"
     minSdk = 31
     targetSdk = 36
-    versionCode = 6
-    versionName = "0.6-camera-framing"
+    versionCode = 7
+    versionName = "0.7-one-minute-camera"
     manifestPlaceholders["mwdat_application_id"] = "0"
     manifestPlaceholders["mwdat_client_token"] = "0"
   }

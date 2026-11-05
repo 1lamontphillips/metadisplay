@@ -1,0 +1,92 @@
+{
+  "application_id": "com.lamontphillips.metadisplay.transporttest",
+  "version_code": 7,
+  "version": "0.7-one-minute-camera",
+  "sdk": "1.0.1",
+  "media3_muxer": "1.11.1",
+  "apk_sha256": "cbf1adac1466f6b5d73e37cfa82c5f10aac5c65c404f6fcacaf5f3f7600fabac",
+  "zip_sha256": "d77ff6394a5de7256d11b2974d9936ac58a6f9afdd709a6952a6d09031b35c56",
+  "zip_bytes": 23153018,
+  "session_plans": {
+    "SHORT": {
+      "fragments": 20,
+      "slot_bytes": 65536,
+      "capture_guard_ms": 35000,
+      "test_http_limit_ms": 75000
+    },
+    "ONE_MINUTE": {
+      "fragments": 60,
+      "slot_bytes": 65536,
+      "capture_guard_ms": 90000,
+      "test_http_limit_ms": 150000
+    }
+  },
+  "change": "Adds one continuous60-fragment camera session with validated per-run producer/cache/deadline/report quotas. Existing20-fragment camera and fixture remain short. Pacing, framing, codec, GOP and permissions unchanged.",
+  "checks": {
+    "host_cases": {
+      "ClipHttpServer": 39,
+      "StreamProbeHttpServer": 60,
+      "FixedBudgetMedia": 60,
+      "LiveClipHttpServer": 38,
+      "CameraFramePacer": 29,
+      "CameraViewTransform": 36,
+      "LiveSessionPlan": 10,
+      "total": 272,
+      "failed": 0
+    },
+    "final_debug_build": "passed",
+    "lint": {
+      "errors": 0,
+      "warnings": 5
+    },
+    "apk_signature": "verified; same certificate as earlier transport builds",
+    "permissions": "CAMERA present; microphone and external/media storage permissions absent; no new permissions",
+    "assets": "all three fixtures unchanged and match source",
+    "one_minute_media3_host_validation": {
+      "media3-original": {
+        "frames": 1440,
+        "encoded_packet_hashes_match_looped_public_fixture": true,
+        "decoded_frame_hashes_match_looped_public_fixture": true,
+        "rational_pts_dts_durations_match_continuous_24fps": true,
+        "duration_seconds": "60.000000",
+        "fragments": 60,
+        "size": 947222,
+        "sha256": "2e0a2cef61514340cdeb2e6aa85ed90a86f5d267196144f4514ea4da46515b35",
+        "all_absolute_tfhd_offsets_match_actual_moof_positions": true
+      },
+      "media3-fixed": {
+        "frames": 1440,
+        "encoded_packet_hashes_match_looped_public_fixture": true,
+        "decoded_frame_hashes_match_looped_public_fixture": true,
+        "rational_pts_dts_durations_match_continuous_24fps": true,
+        "duration_seconds": "60.000000",
+        "fragments": 60,
+        "size": 3932849,
+        "sha256": "ac1efe2b6bb1ba1374d41cf322dc4d27d17c8eace997f4c91c85d478cca808dc",
+        "all_absolute_tfhd_offsets_match_actual_moof_positions": true,
+        "initialization_bytes": 689,
+        "exact_slot_bytes": 65536,
+        "sixty_exact_slots": true,
+        "valid_top_level_free_padding": true,
+        "completed_eof_verified": true,
+        "extra_cache_fragment_rejected": true,
+        "post_quota_muxer_output_cannot_expand_response": true,
+        "sixtieth_slot_emitted_before_muxer_close": true
+      },
+      "limits": "Host simulation uses only the public fixture and the published Media3 classes with test-only Android framework shims. It does not establish real Android camera or Meta glasses one-minute playback or latency."
+    },
+    "one_minute_media_tested_source_sha256": {
+      "FixedBudgetMp4.java": "dce7ccefccbdfb86755a9c16b83efc02f6f5426772df6fd07cbd6ef6be9e6824",
+      "BoundedMediaBuffer.java": "f86d7c61d7ee00f2df62c2b0aa413927a5b64567867621d00144cf4897f70a03"
+    },
+    "independent_review": "both camera modes, per-run quotas, actual report/slot math, permission/view/pacing parity, deadlines, constructor defaults and cleanup reviewed",
+    "change_source_sha256": {
+      "LiveSessionPlan.java": "77110e934178ca289d0fa967cb0644abddd552a50140f05b94ce731e75ac946d",
+      "BoundedMediaBuffer.java": "f86d7c61d7ee00f2df62c2b0aa413927a5b64567867621d00144cf4897f70a03",
+      "LiveClipHttpServer.java": "4751e45c463c1930d98ac0ed4c5b804ae62adc09f868725fc951a2182c6e9424",
+      "PhoneCameraProducer.kt": "2388085b0dc85d236a00b38c91a9d6df7785aca04788e3580d4f67358cc2d6ec",
+      "TransportViewModel.kt": "a6cfc40903c3836a28fc31c857689bfb7d2e6872a854a1b35d545bf89999e211"
+    }
+  },
+  "limits": "User confirmed0.6 short session smooth/readable with about2s observed delay. New0.7 one-minute phone/glasses behavior remains unverified. Host media validation uses public AVC samples with continuous timestamps, not actual camera capture. Sessions remain finite, not indefinite streaming."
+}

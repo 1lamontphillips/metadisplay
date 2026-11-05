@@ -14,6 +14,7 @@ javac --release 17 -d "$transport_test_classes" \
   "$transport_test_root/app/src/main/java/com/lamontphillips/metadisplay/transporttest/LiveVideoConfig.java" \
   "$transport_test_root/app/src/main/java/com/lamontphillips/metadisplay/transporttest/FixedBudgetMp4.java" \
   "$transport_test_root/app/src/main/java/com/lamontphillips/metadisplay/transporttest/BoundedMediaBuffer.java" \
+  "$transport_test_root/app/src/main/java/com/lamontphillips/metadisplay/transporttest/LiveSessionPlan.java" \
   "$transport_test_root/app/src/main/java/com/lamontphillips/metadisplay/transporttest/PaddedFixtureProducer.java" \
   "$transport_test_root/app/src/main/java/com/lamontphillips/metadisplay/transporttest/LiveClipHttpServer.java" \
   "$transport_test_root/app/src/main/java/com/lamontphillips/metadisplay/transporttest/CameraFramePacer.java" \
@@ -21,10 +22,12 @@ javac --release 17 -d "$transport_test_classes" \
   "$transport_test_root/host-tests/com/lamontphillips/metadisplay/transporttest/FixedBudgetMediaTest.java" \
   "$transport_test_root/host-tests/com/lamontphillips/metadisplay/transporttest/LiveClipHttpServerTest.java" \
   "$transport_test_root/host-tests/com/lamontphillips/metadisplay/transporttest/CameraFramePacerTest.java" \
-  "$transport_test_root/host-tests/com/lamontphillips/metadisplay/transporttest/CameraViewTransformTest.java"
+  "$transport_test_root/host-tests/com/lamontphillips/metadisplay/transporttest/CameraViewTransformTest.java" \
+  "$transport_test_root/host-tests/com/lamontphillips/metadisplay/transporttest/LiveSessionPlanTest.java"
 java -cp "$transport_test_classes" com.lamontphillips.metadisplay.transporttest.ClipHttpServerTest
 java -cp "$transport_test_classes" com.lamontphillips.metadisplay.transporttest.StreamProbeHttpServerTest
 java -cp "$transport_test_classes" com.lamontphillips.metadisplay.transporttest.FixedBudgetMediaTest
 java -cp "$transport_test_classes" com.lamontphillips.metadisplay.transporttest.LiveClipHttpServerTest
 java -cp "$transport_test_classes" com.lamontphillips.metadisplay.transporttest.CameraFramePacerTest
 java -cp "$transport_test_classes" com.lamontphillips.metadisplay.transporttest.CameraViewTransformTest
+java -cp "$transport_test_classes" com.lamontphillips.metadisplay.transporttest.LiveSessionPlanTest
