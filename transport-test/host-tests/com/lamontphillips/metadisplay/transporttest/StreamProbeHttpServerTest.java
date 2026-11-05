@@ -47,6 +47,10 @@ public final class StreamProbeHttpServerTest {
     tests.add(new NamedCase("PACED_FILE range duration scales with payload", StreamProbeHttpServerTest::pacedRange));
     tests.add(new NamedCase("PACED_FILE HEAD ignores pacing and EOF hold", () -> head(StreamProbeHttpServer.Delivery.PACED_FILE, true)));
     tests.add(new NamedCase("PACED_FILE payload precedes response completion", () -> eofHold(StreamProbeHttpServer.Delivery.PACED_FILE, false)));
+    tests.add(new NamedCase("PACED_FILE_NO_RANGES preserves known length and progressive bytes", () -> pacedNoRanges("")));
+    tests.add(new NamedCase("PACED_FILE_NO_RANGES ignores bounded Range with full 200", () -> pacedNoRanges("bytes=7-30")));
+    tests.add(new NamedCase("PACED_FILE_NO_RANGES ignores malformed Range with full 200", () -> pacedNoRanges("bytes=9223372036854775808-")));
+    tests.add(new NamedCase("PACED_FILE_NO_RANGES HEAD has exact length and no body", StreamProbeHttpServerTest::noRangesHead));
     tests.add(new NamedCase("PACED_CHUNKED decodes exact payload", StreamProbeHttpServerTest::chunkedGet));
     tests.add(new NamedCase("PACED_CHUNKED ignores bounded Range", () -> chunkedRangeIgnored("bytes=7-30")));
     tests.add(new NamedCase("PACED_CHUNKED ignores unsatisfiable Range", () -> chunkedRangeIgnored("bytes=9223372036854775808-")));
@@ -195,6 +199,53 @@ public final class StreamProbeHttpServerTest {
         eventOrder(fixture, started.transferId, CONTENT.length, true);
       }
     }
+  }
+
+  private static void pacedNoRanges(String range) throws Exception {
+    try (Fixture fixture = new Fixture(StreamProbeHttpServer.Delivery.PACED_FILE_NO_RANGES, 1100, 0)) {
+      long startedAt = System.nanoTime();
+      try (Client client = fixture.request("GET", range.isEmpty() ? "" : "Range: " + range + "\r\n")) {
+        noRangesHeaders(client);
+        StreamProbeHttpServer.Event started = fixture.event(StreamProbeHttpServer.Phase.STARTED, 0);
+        event(started, StreamProbeHttpServer.Phase.STARTED, 200, 0, 0, CONTENT.length - 1);
+        equal(range.isEmpty() ? 0 : 1, started.rangeRequested ? 1 : 0, "safe Range-request flag");
+        equal("CONTENT_LENGTH", started.framing, "truthful fixed-length framing");
+        byte[] first = client.readFixed(1);
+        StreamProbeHttpServer.TransferSnapshot partial = fixture.snapshot(value -> value.id == started.transferId
+            && value.bytesSent > 0 && value.bytesSent < CONTENT.length);
+        equal(CONTENT.length, partial.plannedBytes, "no-range planned bytes");
+        check(!partial.payloadComplete && !partial.responseComplete, "no-range partial flags");
+        equalBytes(CONTENT, concatenate(first, client.readFixed(CONTENT.length - 1)), "no-range exact full body");
+        client.expectEof();
+        check(elapsed(startedAt) >= 650, "no-range control retains gradual delivery");
+        fixture.event(StreamProbeHttpServer.Phase.COMPLETE, started.transferId);
+        completedSnapshot(fixture, started.transferId, CONTENT.length, 0);
+        eventOrder(fixture, started.transferId, CONTENT.length, true);
+      }
+    }
+  }
+
+  private static void noRangesHead() throws Exception {
+    try (Fixture fixture = new Fixture(StreamProbeHttpServer.Delivery.PACED_FILE_NO_RANGES, 1800, 1800)) {
+      long startedAt = System.nanoTime();
+      try (Client client = fixture.request("HEAD", "Range: bytes=7-30\r\n")) {
+        noRangesHeaders(client);
+        client.expectEof();
+      }
+      check(elapsed(startedAt) < 1200, "no-range HEAD ignores pacing and EOF hold");
+      emptySnapshot(fixture.server.getTransferSnapshot());
+      equal(1, fixture.server.getRequestCount(), "no-range HEAD request count");
+      equal(0, fixture.server.getBytesServed(), "no-range HEAD sends no payload");
+    }
+  }
+
+  private static void noRangesHeaders(Client client) {
+    equal(200, client.status, "no-range full-response status");
+    equal("video/mp4", client.header("content-type"), "no-range MP4 type");
+    equal(Integer.toString(CONTENT.length), client.header("content-length"), "no-range known length");
+    equal("none", client.header("accept-ranges"), "no-range seeking disabled");
+    check(!client.headers.containsKey("transfer-encoding"), "no-range control has no Transfer-Encoding");
+    check(!client.headers.containsKey("content-range"), "ignored Range has no Content-Range");
   }
 
   private static void pacedRange() throws Exception {

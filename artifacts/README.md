@@ -1,6 +1,6 @@
 # Display Access Android sample
 
-The latest experiment is [Display Transport Test: delivery check 3](./DisplayTransport-delivery-check-3.zip). Smooth progressive playback of a known-length phone-hosted MP4 has been confirmed in the glasses; this update compares unknown-length delivery methods. See its [phone instructions](./DisplayTransport-delivery-check-3-INSTALL.md). It updates the separate test app and keeps Display Access installed.
+The latest experiment is [Display Transport Test: bounded live camera 4](./DisplayTransport-live-camera-4.zip). It checks a padded finite control before offering a foreground rear-camera test with a real 20-fragment session limit. Physical camera playback remains unverified. See its [phone instructions](./DisplayTransport-live-camera-4-INSTALL.md). It updates the separate test app and keeps Display Access installed.
 
 ## Diagnostic update
 

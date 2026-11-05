@@ -32,6 +32,8 @@ import com.meta.wearable.dat.display.types.VideoSource
 import com.meta.wearable.dat.display.views.VideoPlayer
 import java.net.Inet4Address
 import java.net.InetAddress
+import java.io.IOException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -47,10 +49,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
-/** Finite-clip transport experiment. It does not capture or transmit camera images. */
+/** Finite transport controls and an explicitly bounded, foreground-only live camera experiment. */
 class TransportViewModel(application: Application) : AndroidViewModel(application) {
   private companion object {
     const val REFERENCE_URL =
@@ -58,6 +61,8 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
     const val MAX_EVENTS = 240
     const val TEST_TIMEOUT_MS = 30_000L
     const val STREAM_TEST_TIMEOUT_MS = 55_000L
+    const val BOUNDED_TEST_TIMEOUT_MS = 75_000L
+    const val SOURCE_INIT_TIMEOUT_MS = 5_000L
     const val STREAM_PACING_MS = 20_000L
     const val STREAM_EOF_HOLD_MS = 2_000L
     const val STOP_TIMEOUT_MS = 2_000L
@@ -92,11 +97,17 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
       val number: Int,
       val mode: TestMode,
       val selectedDevice: DeviceIdentifier,
+      val displayRotation: Int,
       val job: Job,
       val scope: CoroutineScope,
   ) {
     var server: ClipHttpServer? = null
     var streamServer: StreamProbeHttpServer? = null
+    var liveServer: LiveClipHttpServer? = null
+    var mediaBuffer: BoundedMediaBuffer? = null
+    var cameraProducer: PhoneCameraProducer? = null
+    var fixtureProducer: PaddedFixtureProducer? = null
+    @Volatile var temporaryCleanupFailed = false
     var streamAssetBytes = 0L
     var firstPlayCaptured = false
     var transferCaveatRecorded = false
@@ -237,11 +248,17 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
     }
   }
 
-  fun startTest(mode: TestMode) {
+  fun startTest(mode: TestMode, displayRotation: Int = 0) {
     viewModelScope.launch {
       refreshNetwork()
       refreshReadiness()
       if (!_state.value.canStart || cleared) return@launch
+      if (mode == TestMode.LIVE_CAMERA && app.checkSelfPermission(Manifest.permission.CAMERA) !=
+          PackageManager.PERMISSION_GRANTED) {
+        record("Camera permission is required for the live test")
+        _state.value = _state.value.copy(lastError = "Allow Camera access before the live test.")
+        return@launch
+      }
       if (mode == TestMode.WIFI && activePrivateAddress() == null) {
         _state.value = _state.value.copy(lastError = "Connect the phone to Wi-Fi first.")
         return@launch
@@ -257,20 +274,31 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
           }
         }
       }
-      run = TestRun(++nextRun, mode, selected, job,
+      run = TestRun(++nextRun, mode, selected, displayRotation, job,
           CoroutineScope(Dispatchers.Main.immediate + job + failures))
       activeRun = run
       _state.value = _state.value.copy(busy = true, canStart = false,
-          currentMode = mode.name, phase = "Preparing finite clip", playerState = "IDLE",
+          currentMode = mode.name, phase = if (isBoundedMode(mode)) "Preparing bounded source"
+              else "Preparing finite clip", playerState = "IDLE",
           lastError = null, httpRequests = 0, httpBytes = 0,
-          streamEvidence = if (isStreamMode(mode)) "Awaiting first SDK PLAYING snapshot."
-              else "File control; no stream transfer snapshot.")
+          streamEvidence = if (isStreamMode(mode) || isBoundedMode(mode))
+              "Awaiting first SDK PLAYING snapshot." else "File control; no stream transfer snapshot.",
+          cameraEvidence = if (mode == TestMode.LIVE_CAMERA) "Camera starting" else "Camera inactive",
+          boundedEvidence = if (isBoundedMode(mode))
+              "Finite experiment: ${LiveVideoConfig.FRAGMENTS} slots, ${LiveVideoConfig.SLOT_BYTES} bytes each; awaiting initialization."
+              else "")
       firstPlaySnapshotReport = "No first SDK PLAYING snapshot captured."
       configuredTransportReport = configuredTransport(mode)
       actualTransportReport = "No stream HTTP response observed."
-      record("Test ${run.number}: ${mode.name}; finite MP4 only")
+      record("Test ${run.number}: ${mode.name}; " + if (mode == TestMode.LIVE_CAMERA)
+          "bounded live camera, ${LiveVideoConfig.FRAGMENTS} fragments; foreground only"
+          else "finite MP4 fixture only")
       record("Configured response: $configuredTransportReport")
-      val timeoutMs = if (isExtendedMode(mode)) STREAM_TEST_TIMEOUT_MS else TEST_TIMEOUT_MS
+      val timeoutMs = when {
+        isBoundedMode(mode) -> BOUNDED_TEST_TIMEOUT_MS
+        isExtendedMode(mode) -> STREAM_TEST_TIMEOUT_MS
+        else -> TEST_TIMEOUT_MS
+      }
       run.scope.launch {
         delay(timeoutMs)
         if (isCurrent(run)) finish(run, "Test reached ${timeoutMs / 1000}-second limit",
@@ -284,6 +312,7 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
   }
 
   private suspend fun prepareSource(run: TestRun): String? {
+    if (isBoundedMode(run.mode)) return prepareBoundedSource(run)
     if (isStreamMode(run.mode)) return prepareStreamSource(run)
     if (run.mode == TestMode.REFERENCE) {
       record("Source: original public reference clip")
@@ -336,12 +365,15 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
   private fun isStreamMode(mode: TestMode): Boolean = when (mode) {
     TestMode.FRAGMENTED_FILE, TestMode.PACED_FILE, TestMode.PACED_CHUNKED,
     TestMode.CHUNKED_FILE, TestMode.CLOSE_FILE, TestMode.PACED_CLOSE,
-    TestMode.PACED_CLOSE_HTTP10 -> true
+    TestMode.PACED_CLOSE_HTTP10, TestMode.KNOWN_LENGTH_NO_RANGES -> true
     else -> false
   }
 
   private fun isExtendedMode(mode: TestMode): Boolean =
       mode == TestMode.STREAM_CONTROL || isStreamMode(mode)
+
+  private fun isBoundedMode(mode: TestMode): Boolean =
+      mode == TestMode.PADDED_CONTROL || mode == TestMode.LIVE_CAMERA
 
   private fun configuredTransport(mode: TestMode): String = when (mode) {
     TestMode.REFERENCE -> "Public reference URL; remote protocol/framing is not measured"
@@ -351,6 +383,10 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
         "HTTP/1.1 CONNECTION_CLOSE; no Content-Length or Transfer-Encoding"
     TestMode.PACED_CLOSE_HTTP10 ->
         "HTTP/1.0 CONNECTION_CLOSE; no Content-Length or Transfer-Encoding"
+    TestMode.KNOWN_LENGTH_NO_RANGES ->
+        "HTTP/1.1 CONTENT_LENGTH; finite exact length with ranges disabled"
+    TestMode.PADDED_CONTROL, TestMode.LIVE_CAMERA ->
+        "CONTENT_LENGTH; exact initialization plus ${LiveVideoConfig.FRAGMENTS} fixed ${LiveVideoConfig.SLOT_BYTES}-byte MP4 fragment slots; ranges supported; loopback only"
     else -> "HTTP/1.1 CONTENT_LENGTH; finite body ends at its declared length"
   }
 
@@ -370,10 +406,11 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
       TestMode.CLOSE_FILE -> StreamProbeHttpServer.Delivery.CLOSE_FILE
       TestMode.PACED_CLOSE -> StreamProbeHttpServer.Delivery.PACED_CLOSE
       TestMode.PACED_CLOSE_HTTP10 -> StreamProbeHttpServer.Delivery.PACED_CLOSE_HTTP10
+      TestMode.KNOWN_LENGTH_NO_RANGES -> StreamProbeHttpServer.Delivery.PACED_FILE_NO_RANGES
       else -> return null
     }
     val paced = run.mode in setOf(TestMode.PACED_FILE, TestMode.PACED_CHUNKED,
-        TestMode.PACED_CLOSE, TestMode.PACED_CLOSE_HTTP10)
+        TestMode.PACED_CLOSE, TestMode.PACED_CLOSE_HTTP10, TestMode.KNOWN_LENGTH_NO_RANGES)
     val pacingMs = if (paced) STREAM_PACING_MS else 0L
     // With a known Content-Length, the client sees end-of-body at the last byte.
     // Unknown-length responses can hold the chunk terminator or socket EOF instead.
@@ -410,6 +447,216 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
         withContext(NonCancellable + Dispatchers.IO) { server.close() }
       }
     }
+  }
+
+  private suspend fun prepareBoundedSource(run: TestRun): String? {
+    val loopback = InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))
+    var temporaryBuffer: BoundedMediaBuffer? = null
+    var temporaryCamera: PhoneCameraProducer? = null
+    var temporaryFixture: PaddedFixtureProducer? = null
+    var temporaryServer: LiveClipHttpServer? = null
+    try {
+      // Interrupt the bounded initialization wait when Stop/background cancels this run.
+      // Locals retain ownership until Main accepts every resource together.
+      runInterruptible(Dispatchers.IO) {
+        val buffer = BoundedMediaBuffer(LiveVideoConfig.FRAGMENTS, LiveVideoConfig.SLOT_BYTES)
+        temporaryBuffer = buffer
+        if (run.mode == TestMode.LIVE_CAMERA) {
+          val camera = PhoneCameraProducer(app, buffer, run.displayRotation) { event ->
+            viewModelScope.launch {
+              if (isCurrent(run)) recordCameraEvent(run, event)
+            }
+          }
+          temporaryCamera = camera
+          camera.start()
+        } else {
+          val clip = app.assets.open("fragmented.mp4").use { it.readBytes() }
+          val fixture = PaddedFixtureProducer(clip, buffer, LiveVideoConfig.FRAGMENTS,
+              LiveVideoConfig.SLOT_BYTES, LiveVideoConfig.FIXTURE_CADENCE_MS) { status ->
+            viewModelScope.launch {
+              if (isCurrent(run)) recordFixtureStatus(run, status)
+            }
+          }
+          temporaryFixture = fixture
+          fixture.start()
+        }
+        if (!buffer.awaitInitialized(SOURCE_INIT_TIMEOUT_MS)) {
+          throw IOException("SOURCE_INIT_TIMEOUT")
+        }
+        if (!run.job.isActive) throw CancellationException("Run canceled")
+        val server = LiveClipHttpServer(buffer, loopback) { event ->
+          viewModelScope.launch {
+            if (isCurrent(run)) recordLiveHttpEvent(run, event)
+          }
+        }
+        temporaryServer = server
+        server.start()
+      }
+      if (!isCurrent(run)) return null
+      val buffer = temporaryBuffer ?: return null
+      val server = temporaryServer ?: return null
+      run.mediaBuffer = buffer
+      run.cameraProducer = temporaryCamera
+      run.fixtureProducer = temporaryFixture
+      run.liveServer = server
+      run.streamAssetBytes = buffer.contentLength
+      temporaryBuffer = null
+      temporaryCamera = null
+      temporaryFixture = null
+      temporaryServer = null
+      record("Bounded source initialized: slots=${LiveVideoConfig.FRAGMENTS}, " +
+          "slotBytes=${LiveVideoConfig.SLOT_BYTES}, exactContentLength=${run.streamAssetBytes}; " +
+          "loopback only; no disk recording")
+      updateHttpCounts(run)
+      refreshBoundedEvidence(run)
+      retainCameraSnapshot(run.cameraProducer)
+      return "http://${loopback.hostAddress}:${server.port}${server.path}"
+    } catch (canceled: CancellationException) {
+      throw canceled
+    } catch (_: Exception) {
+      if (isCurrent(run)) {
+        record("Bounded source initialization failed; no exception details retained")
+        finish(run, "Source initialization failed", if (run.mode == TestMode.LIVE_CAMERA)
+            "The camera source could not be prepared" else "The padded control could not be prepared")
+      }
+      return null
+    } finally {
+      if (temporaryBuffer != null || temporaryCamera != null || temporaryFixture != null ||
+          temporaryServer != null) {
+        val result = closeBoundedResources(temporaryBuffer, temporaryCamera,
+            temporaryFixture, temporaryServer)
+        if (!result.closed) run.temporaryCleanupFailed = true
+        withContext(NonCancellable + Dispatchers.Main.immediate) {
+          if (!cleared && nextRun == run.number && (activeRun == null || isCurrent(run))) {
+            retainCameraSnapshot(result.camera)
+            _state.value = _state.value.copy(boundedEvidence = boundedSummary(
+                result.producedBytes, result.plannedBytes, result.fragments, result.complete))
+          }
+        }
+      }
+    }
+  }
+
+  private data class BoundedCleanupResult(
+      val closed: Boolean,
+      val producedBytes: Long,
+      val plannedBytes: Long,
+      val fragments: Int,
+      val complete: Boolean,
+      val camera: PhoneCameraProducer.Snapshot?,
+  )
+
+  private suspend fun closeBoundedResources(
+      buffer: BoundedMediaBuffer?,
+      camera: PhoneCameraProducer?,
+      fixture: PaddedFixtureProducer?,
+      server: LiveClipHttpServer?,
+  ): BoundedCleanupResult = withContext(NonCancellable + Dispatchers.IO) {
+    // Independent producers/server stop concurrently. None of these calls runs on Main.
+    val stopCamera = async { closeSource { camera?.close() } }
+    val stopFixture = async { closeSource { fixture?.close() } }
+    val stopServer = async { closeSource { server?.close() } }
+    val cameraClosed = stopCamera.await()
+    val fixtureClosed = stopFixture.await()
+    val serverClosed = stopServer.await()
+    val snapshot = try { camera?.snapshot() } catch (_: Exception) { null }
+    val produced = buffer?.producedBytes ?: 0L
+    val planned = buffer?.contentLength ?: 0L
+    val fragments = buffer?.completedSlots ?: 0
+    val complete = buffer?.isComplete ?: false
+    val bufferClosed = closeSource { buffer?.close() }
+    BoundedCleanupResult(cameraClosed && fixtureClosed && serverClosed && bufferClosed,
+        produced, planned, fragments, complete, snapshot)
+  }
+
+  private fun closeSource(close: () -> Unit): Boolean = try {
+    close()
+    true
+  } catch (_: Exception) {
+    false
+  }
+
+  private fun recordFixtureStatus(run: TestRun, status: String) {
+    if (status !in setOf("STARTED", "COMPLETE", "FAILED")) return
+    record("Padded public fixture producer: $status")
+    refreshBoundedEvidence(run)
+    if (status == "FAILED") {
+      finish(run, "Padded control failed", "FIXTURE_FAILED")
+    }
+  }
+
+  private fun safeCameraState(value: String): String =
+      if (value in setOf("IDLE", "STARTING", "RUNNING", "COMPLETE", "STOPPED", "FAILED"))
+          value else "UNKNOWN"
+
+  private fun safeCameraCode(value: String): String {
+    val codes = setOf("CAMERA_STARTING", "CAMERA_RUNNING", "CAMERA_PROGRESS",
+        "CAMERA_COMPLETE", "CAMERA_STOPPED", "CAMERA_PERMISSION_REQUIRED", "NO_REAR_CAMERA",
+        "NO_AVC_ENCODER", "CAMERA_OPEN_FAILED", "CAMERA_CONFIGURE_FAILED", "CAMERA_EGL_FAILED",
+        "CAMERA_CODEC_FAILED", "CAMERA_MUXER_FAILED", "CAMERA_INIT_TIMEOUT",
+        "CAMERA_FRAME_TIMEOUT", "CAMERA_FRAME_STALLED", "CAMERA_SLOT_TIMEOUT", "CAMERA_INTERRUPTED",
+        "CAMERA_CLEANUP_FAILED", "CAMERA_FAILED")
+    return if (value in codes) value else "CAMERA_FAILED"
+  }
+
+  private fun cameraSummary(state: String, captured: Long, encoded: Long,
+      fragments: Int, width: Int, height: Int): String =
+      "Camera state=${safeCameraState(state)}; capturedFrames=${captured.coerceAtLeast(0)}, " +
+          "encodedFrames=${encoded.coerceAtLeast(0)}, fragments=${fragments.coerceAtLeast(0)}/" +
+          "${LiveVideoConfig.FRAGMENTS}, size=${width.coerceIn(0, 65535)}x" +
+          "${height.coerceIn(0, 65535)}; foreground-only finite experiment"
+
+  private fun recordCameraEvent(run: TestRun, event: PhoneCameraProducer.Event) {
+    val kind = if (event.kind in setOf("STATE", "PROGRESS", "FAILED", "COMPLETE"))
+        event.kind else return
+    val code = safeCameraCode(event.code)
+    val state = when {
+      kind == "FAILED" -> "FAILED"
+      kind == "COMPLETE" -> "COMPLETE"
+      code == "CAMERA_STARTING" -> "STARTING"
+      code == "CAMERA_STOPPED" -> "STOPPED"
+      else -> "RUNNING"
+    }
+    val summary = cameraSummary(state, event.capturedFrames, event.encodedFrames,
+        event.completedFragments, event.width, event.height)
+    _state.value = _state.value.copy(cameraEvidence = summary)
+    record("Camera $kind: $code; $summary")
+    refreshBoundedEvidence(run)
+    if (kind == "FAILED") {
+      finish(run, "Camera source failed", code)
+    } else if (kind == "COMPLETE") {
+      _state.value = _state.value.copy(
+          phase = "Finite camera capture complete; waiting for video playback to finish")
+    }
+  }
+
+  private fun retainCameraSnapshot(producer: PhoneCameraProducer?) {
+    if (producer == null) return
+    try {
+      val snapshot = producer.snapshot()
+      retainCameraSnapshot(snapshot)
+    } catch (_: Exception) {
+      record("Camera counters unavailable; no exception details retained")
+    }
+  }
+
+  private fun retainCameraSnapshot(snapshot: PhoneCameraProducer.Snapshot?) {
+    if (snapshot == null) return
+    _state.value = _state.value.copy(cameraEvidence = cameraSummary(snapshot.state,
+        snapshot.capturedFrames, snapshot.encodedFrames, snapshot.completedFragments,
+        snapshot.width, snapshot.height))
+  }
+
+  private fun boundedSummary(produced: Long, planned: Long, fragments: Int,
+      complete: Boolean): String =
+      "Finite source: produced=${produced.coerceAtLeast(0)}/${planned.coerceAtLeast(0)} bytes, " +
+          "slots=${fragments.coerceAtLeast(0)}/${LiveVideoConfig.FRAGMENTS}, " +
+          "productionComplete=$complete; no indefinite playback claim"
+
+  private fun refreshBoundedEvidence(run: TestRun) {
+    val buffer = run.mediaBuffer ?: return
+    _state.value = _state.value.copy(boundedEvidence = boundedSummary(buffer.producedBytes,
+        buffer.contentLength, buffer.completedSlots, buffer.isComplete))
   }
 
   private fun createSession(run: TestRun, url: String) {
@@ -557,10 +804,48 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
     }
   }
 
+  private data class TransferEvidence(
+      val id: Long, val bytesSent: Long, val plannedBytes: Long,
+      val payloadComplete: Boolean, val responseComplete: Boolean,
+      val writeInProgress: Boolean, val activeGetCount: Int, val totalGetCount: Long,
+      val status: Int, val start: Long, val end: Long, val rangeRequested: Boolean,
+      val requestProtocol: String, val responseProtocol: String, val framing: String,
+      val sourceBytesProduced: Long? = null,
+  )
+
+  private fun transferEvidence(
+      streamServer: StreamProbeHttpServer?,
+      liveServer: LiveClipHttpServer?,
+  ): TransferEvidence? {
+    if (liveServer != null) {
+      val s = liveServer.transferSnapshot
+      return TransferEvidence(s.id, s.bytesSent, s.plannedBytes, s.payloadComplete,
+          s.responseComplete, s.writeInProgress, s.activeGetCount, s.totalGetCount, s.status,
+          s.start, s.end, s.rangeRequested, s.requestProtocol, s.responseProtocol, s.framing,
+          s.sourceBytesProduced)
+    }
+    val s = streamServer?.transferSnapshot ?: return null
+    return TransferEvidence(s.id, s.bytesSent, s.plannedBytes, s.payloadComplete,
+        s.responseComplete, s.writeInProgress, s.activeGetCount, s.totalGetCount, s.status,
+        s.start, s.end, s.rangeRequested, s.requestProtocol, s.responseProtocol, s.framing)
+  }
+
+  private fun retainActualTransport(
+      streamServer: StreamProbeHttpServer?,
+      liveServer: LiveClipHttpServer?,
+  ) {
+    val s = transferEvidence(streamServer, liveServer) ?: return
+    if (s.id > 0) {
+      actualTransportReport = "requestProtocol=${safeProtocol(s.requestProtocol)}, " +
+          "responseProtocol=${safeProtocol(s.responseProtocol)}, framing=${safeFraming(s.framing)}, " +
+          "rangeRequested=${s.rangeRequested}"
+    }
+  }
+
   private fun captureFirstPlaying(run: TestRun) {
     run.firstPlayCaptured = true
-    val server = run.streamServer
-    if (server == null) {
+    val snapshot = transferEvidence(run.streamServer, run.liveServer)
+    if (snapshot == null) {
       firstPlaySnapshotReport = "First SDK PLAYING observed in ${run.mode.name}; " +
           "this file control has no stream transfer snapshot."
       _state.value = _state.value.copy(streamEvidence =
@@ -568,7 +853,6 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
       record(firstPlaySnapshotReport)
       return
     }
-    val snapshot = server.transferSnapshot
     val requestProtocol = safeProtocol(snapshot.requestProtocol)
     val responseProtocol = safeProtocol(snapshot.responseProtocol)
     val framing = safeFraming(snapshot.framing)
@@ -576,11 +860,12 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
       actualTransportReport = "requestProtocol=$requestProtocol, responseProtocol=$responseProtocol, " +
           "framing=$framing, rangeRequested=${snapshot.rangeRequested}"
     }
-    val ignoredUnknownLengthRange = snapshot.rangeRequested &&
-        framing in setOf("CHUNKED", "CONNECTION_CLOSE") && snapshot.status == 200
+    val ignoredFullRange = snapshot.rangeRequested && snapshot.status == 200 &&
+        (framing in setOf("CHUNKED", "CONNECTION_CLOSE") ||
+            run.mode == TestMode.KNOWN_LENGTH_NO_RANGES)
     val singleFullGet = snapshot.id > 0 && snapshot.totalGetCount == 1L &&
         snapshot.activeGetCount <= 1 && snapshot.status == 200 &&
-        (!snapshot.rangeRequested || ignoredUnknownLengthRange) &&
+        (!snapshot.rangeRequested || ignoredFullRange) &&
         snapshot.start == 0L && snapshot.end == run.streamAssetBytes - 1L &&
         snapshot.plannedBytes == run.streamAssetBytes
     val summary = when {
@@ -591,8 +876,14 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
       !snapshot.payloadComplete && !snapshot.responseComplete &&
           snapshot.activeGetCount == 1 && !snapshot.writeInProgress &&
           snapshot.bytesSent < snapshot.plannedBytes ->
-          "At first SDK PLAYING, the single full-file GET still had unsent media bytes " +
-              "(${snapshot.bytesSent}/${snapshot.plannedBytes} written). Confirm video in glasses."
+          if (isBoundedMode(run.mode)) {
+            "At first SDK PLAYING, the single full GET still had unsent response bytes " +
+                "(${snapshot.bytesSent}/${snapshot.plannedBytes} written). The response includes " +
+                "padding; confirm live motion and latency in the glasses separately."
+          } else {
+            "At first SDK PLAYING, the single full-file GET still had unsent media bytes " +
+                "(${snapshot.bytesSent}/${snapshot.plannedBytes} written). Confirm video in glasses."
+          }
       snapshot.payloadComplete && !snapshot.responseComplete ->
           "All media bytes were already written at first SDK PLAYING; only the HTTP response " +
               "remained open. This does not establish playback during media transfer."
@@ -609,14 +900,30 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
         "activeGetCount=${snapshot.activeGetCount}, totalGetCount=${snapshot.totalGetCount}, " +
         "status=${snapshot.status}, range=${snapshot.start}-${snapshot.end}, " +
         "rangeRequested=${snapshot.rangeRequested}, fullAssetBytes=${run.streamAssetBytes}, " +
-        "singleFullGet=$singleFullGet"
+        "singleFullGet=$singleFullGet" + if (snapshot.sourceBytesProduced != null)
+            ", sourceBytesProduced=${snapshot.sourceBytesProduced}" else ""
     firstPlaySnapshotReport = "$exact\n$summary\n" +
         "Bytes measure server socket writes, not client receipt, decoding or visible display. " +
         "SDK PLAYING alone does not confirm video in glasses."
-    val rangeCaveat = if (ignoredUnknownLengthRange) {
+    val rangeCaveat = if (ignoredFullRange) {
       " Range was ignored for the full 200 response; seeking/range support is not established."
     } else ""
     firstPlaySnapshotReport += rangeCaveat
+    if (isBoundedMode(run.mode)) {
+      val initializationBytes = run.streamAssetBytes -
+          LiveVideoConfig.FRAGMENTS.toLong() * LiveVideoConfig.SLOT_BYTES
+      val producedSlots = (((snapshot.sourceBytesProduced ?: 0L) - initializationBytes)
+          .coerceAtLeast(0L) / LiveVideoConfig.SLOT_BYTES).coerceAtMost(LiveVideoConfig.FRAGMENTS.toLong())
+      val production = "Bounded source at first SDK PLAYING: " +
+          "produced=${snapshot.sourceBytesProduced ?: 0L}/${run.streamAssetBytes}, " +
+          "completeSlotsProduced=$producedSlots/${LiveVideoConfig.FRAGMENTS}, " +
+          "fixedSlots=${LiveVideoConfig.FRAGMENTS}, slotBytes=${LiveVideoConfig.SLOT_BYTES}. " +
+          "This does not measure visible playback, live latency, or indefinite streaming."
+      firstPlaySnapshotReport += "\n$production"
+      record(production)
+      retainCameraSnapshot(run.cameraProducer)
+      refreshBoundedEvidence(run)
+    }
     _state.value = _state.value.copy(streamEvidence = summary + rangeCaveat)
     record(exact)
     record(summary + rangeCaveat)
@@ -625,9 +932,10 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
   private fun retainTransferCaveat(
       run: TestRun,
       server: StreamProbeHttpServer? = run.streamServer,
+      liveServer: LiveClipHttpServer? = run.liveServer,
   ) {
     if (!run.firstPlayCaptured || run.transferCaveatRecorded) return
-    val snapshot = server?.transferSnapshot ?: return
+    val snapshot = transferEvidence(server, liveServer) ?: return
     if (snapshot.totalGetCount > 1 || snapshot.status == 206 || snapshot.start > 0) {
       run.transferCaveatRecorded = true
       val caveat = "Multiple GETs or a partial response occurred in this test; first-PLAYING timing " +
@@ -657,8 +965,12 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
 
   private fun finish(run: TestRun, phase: String, error: String?) {
     if (!isCurrent(run)) return
+    // Capture live counters directly even if queued HTTP/producer callbacks have not run.
+    retainActualTransport(run.streamServer, run.liveServer)
+    refreshBoundedEvidence(run)
+    retainCameraSnapshot(run.cameraProducer)
     retainTransferCaveat(run)
-    if (isStreamMode(run.mode) && !run.firstPlayCaptured) {
+    if ((isStreamMode(run.mode) || isBoundedMode(run.mode)) && !run.firstPlayCaptured) {
       val missing = "SDK never reported PLAYING during this test; no first-PLAYING snapshot."
       firstPlaySnapshotReport = missing
       _state.value = _state.value.copy(streamEvidence = missing)
@@ -674,12 +986,20 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
     updateHttpCounts(run)
     val server = run.server
     val streamServer = run.streamServer
+    val liveServer = run.liveServer
+    val mediaBuffer = run.mediaBuffer
+    val cameraProducer = run.cameraProducer
+    val fixtureProducer = run.fixtureProducer
     val session = run.session
     run.player = null
     run.display = null
     run.session = null
     run.server = null
     run.streamServer = null
+    run.liveServer = null
+    run.mediaBuffer = null
+    run.cameraProducer = null
+    run.fixtureProducer = null
     _state.value = _state.value.copy(busy = true, canStart = false,
         phase = "Closing test resources", lastError = error)
     refreshReadiness()
@@ -700,6 +1020,9 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
         }
         closed
       }
+      val boundedClose = async(Dispatchers.IO) {
+        closeBoundedResources(mediaBuffer, cameraProducer, fixtureProducer, liveServer)
+      }
       val observersStopped = async {
         withTimeoutOrNull(WORKER_CLEANUP_TIMEOUT_MS) {
           // Includes a temporary server still owned by prepareSource's finally block.
@@ -713,19 +1036,28 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
           true
         } == true
       }
-      val serverClosed = serverClose.await()
+      val ordinaryServersClosed = serverClose.await()
+      val boundedResult = boundedClose.await()
       val workersStopped = observersStopped.await()
+      val serverClosed = ordinaryServersClosed && boundedResult.closed && !run.temporaryCleanupFailed
       if (!cleared && activeRun == null && nextRun == run.number) {
-        updateHttpCounts(server, streamServer)
-        retainTransferCaveat(run, streamServer)
+        updateHttpCounts(server, streamServer, liveServer)
+        retainActualTransport(streamServer, liveServer)
+        retainTransferCaveat(run, streamServer, liveServer)
+        retainCameraSnapshot(boundedResult.camera)
+        if (isBoundedMode(run.mode) && mediaBuffer != null) {
+          _state.value = _state.value.copy(boundedEvidence = boundedSummary(
+              boundedResult.producedBytes, boundedResult.plannedBytes,
+              boundedResult.fragments, boundedResult.complete))
+        }
         if (!stopped) record("Cleanup: session STOPPED not observed within 2 seconds")
-        if (!serverClosed) record("Phone server close threw; no exception details retained")
+        if (!serverClosed) record("Source/server cleanup unconfirmed; no exception details retained")
         if (!workersStopped) record("Cleanup: canceled operations did not finish within 5 seconds")
         if (!stopped || !serverClosed || !workersStopped) {
           cleanupBlocked = true
           val reasons = buildList {
             if (!stopped) add("session STOPPED was not confirmed")
-            if (!serverClosed) add("phone server close failed")
+            if (!serverClosed) add("source or phone server cleanup was not confirmed")
             if (!workersStopped) add("canceled operations did not finish")
           }.joinToString("; ")
           cleanupBlockReason = listOfNotNull(error, "Cleanup unconfirmed: $reasons.",
@@ -882,14 +1214,37 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
     retainTransferCaveat(run)
   }
 
-  private fun updateHttpCounts(run: TestRun) {
-    updateHttpCounts(run.server, run.streamServer)
+  private fun recordLiveHttpEvent(run: TestRun, event: LiveClipHttpServer.Event) {
+    val method = if (event.method in setOf("GET", "HEAD")) event.method else "OTHER"
+    val outcomes = setOf("accept_failed", "busy", "client_disconnected", "connection_failed",
+        "headers_too_large", "malformed_request", "method_not_allowed", "not_found",
+        "range_not_satisfiable", "read_timeout", "request_line_too_long", "served",
+        "server_error", "stopped", "write_failed", "started", "progress",
+        "source_failed", "source_timeout", "source_unavailable", "initialization_failed")
+    val outcome = if (event.outcome in outcomes) event.outcome else "other"
+    val transport = "requestProtocol=${safeProtocol(event.requestProtocol)}, " +
+        "responseProtocol=${safeProtocol(event.responseProtocol)}, " +
+        "framing=${safeFraming(event.framing)}, rangeRequested=${event.rangeRequested}"
+    if (event.assetRequest) actualTransportReport = transport
+    record("Bounded HTTP $method ${event.phase.name}: $transport, transfer=${event.transferId}, " +
+        "status=${event.status}, bytes=${event.bytesSent}, range=${event.start}-${event.end}, " +
+        "asset=${event.assetRequest}, outcome=$outcome")
+    updateHttpCounts(run)
+    refreshBoundedEvidence(run)
+    retainTransferCaveat(run)
   }
 
-  private fun updateHttpCounts(server: ClipHttpServer?, streamServer: StreamProbeHttpServer?) {
-    if (server == null && streamServer == null) return
-    val requests = (server?.requestCount ?: 0L) + (streamServer?.requestCount ?: 0L)
-    val bytes = (server?.bytesServed ?: 0L) + (streamServer?.bytesServed ?: 0L)
+  private fun updateHttpCounts(run: TestRun) {
+    updateHttpCounts(run.server, run.streamServer, run.liveServer)
+  }
+
+  private fun updateHttpCounts(server: ClipHttpServer?, streamServer: StreamProbeHttpServer?,
+      liveServer: LiveClipHttpServer? = null) {
+    if (server == null && streamServer == null && liveServer == null) return
+    val requests = (server?.requestCount ?: 0L) + (streamServer?.requestCount ?: 0L) +
+        (liveServer?.requestCount ?: 0L)
+    val bytes = (server?.bytesServed ?: 0L) + (streamServer?.bytesServed ?: 0L) +
+        (liveServer?.bytesServed ?: 0L)
     _state.value = _state.value.copy(
         httpRequests = requests.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(), httpBytes = bytes)
   }
@@ -903,9 +1258,11 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
   fun copyReport(): String {
     val snapshot = _state.value
     return buildString {
-      appendLine("MetaDisplay transport probe 0.3; SDK 1.0.1")
-      appendLine("Finite MP4 fixtures and the original public reference URL; no camera capture.")
-      appendLine("New stream fixtures: 20-second silent H.264; control and fMP4 share encoded packets.")
+      appendLine("MetaDisplay bounded live camera experiment 0.4; SDK 1.0.1")
+      appendLine("LIVE_CAMERA uses the phone rear camera only while this app is visible; controls use public fixtures.")
+      appendLine("Silent, finite ${LiveVideoConfig.FRAGMENTS}-fragment experiment (roughly 20 seconds), not indefinite streaming.")
+      appendLine("Exact response budget: initialization plus ${LiveVideoConfig.FRAGMENTS} valid ${LiveVideoConfig.SLOT_BYTES}-byte fragment slots; no estimated Content-Length.")
+      appendLine("Camera media stays in bounded temporary memory; no microphone or disk recording.")
       appendLine("SDK PLAYING/ENDED does not confirm visible playback in glasses.")
       appendLine("Addresses, URL tokens, device names/IDs and credentials are omitted.")
       appendLine("Registration: ${snapshot.registration}")
@@ -917,6 +1274,8 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
       appendLine("Cleanup blocked: $cleanupBlocked")
       cleanupBlockReason?.let { appendLine("Cleanup block details: $it") }
       appendLine("Phone HTTP requests: ${snapshot.httpRequests}; bytes: ${snapshot.httpBytes}")
+      appendLine("Camera: ${snapshot.cameraEvidence}")
+      if (snapshot.boundedEvidence.isNotEmpty()) appendLine(snapshot.boundedEvidence)
       appendLine("Stream evidence: ${snapshot.streamEvidence}")
       appendLine(firstPlaySnapshotReport)
       appendLine("Retained events (maximum $MAX_EVENTS):")

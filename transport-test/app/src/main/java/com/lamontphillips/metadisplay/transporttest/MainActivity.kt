@@ -6,6 +6,8 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.view.Surface
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -33,6 +35,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -47,6 +50,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 class MainActivity : ComponentActivity() {
   private val model: TransportViewModel by viewModels()
   private var bluetoothGranted by mutableStateOf(false)
+  private var cameraGranted by mutableStateOf(false)
   private var requestedPermission = false
   private val permissionRequest = registerForActivityResult(
       ActivityResultContracts.RequestPermission(),
@@ -54,6 +58,9 @@ class MainActivity : ComponentActivity() {
     bluetoothGranted = granted
     if (granted) model.initialize()
   }
+  private val cameraPermissionRequest = registerForActivityResult(
+      ActivityResultContracts.RequestPermission(),
+  ) { granted -> cameraGranted = granted }
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
@@ -61,12 +68,18 @@ class MainActivity : ComponentActivity() {
     setContent {
       MaterialTheme(colorScheme = lightColorScheme(primary = Color(0xFF2457D6))) {
         val state by model.state.collectAsStateWithLifecycle()
+        DisposableEffect(state.busy) {
+          if (state.busy) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+          onDispose { window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+        }
         TransportScreen(
             state = state,
             permissionGranted = bluetoothGranted,
+            cameraPermissionGranted = cameraGranted,
             onPermission = { permissionRequest.launch(Manifest.permission.BLUETOOTH_CONNECT) },
             onConnect = { model.connect(this) },
-            onStart = model::startTest,
+            onCameraPermission = { cameraPermissionRequest.launch(Manifest.permission.CAMERA) },
+            onStart = { mode -> model.startTest(mode, display?.rotation ?: Surface.ROTATION_0) },
             onStop = model::stopTest,
             onCopy = {
               val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -82,6 +95,8 @@ class MainActivity : ComponentActivity() {
     super.onStart()
     model.onForegroundChanged(true)
     bluetoothGranted = checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) ==
+        PackageManager.PERMISSION_GRANTED
+    cameraGranted = checkSelfPermission(Manifest.permission.CAMERA) ==
         PackageManager.PERMISSION_GRANTED
     if (bluetoothGranted) {
       model.initialize()
@@ -101,8 +116,10 @@ class MainActivity : ComponentActivity() {
 private fun TransportScreen(
     state: TransportState,
     permissionGranted: Boolean,
+    cameraPermissionGranted: Boolean,
     onPermission: () -> Unit,
     onConnect: () -> Unit,
+    onCameraPermission: () -> Unit,
     onStart: (TestMode) -> Unit,
     onStop: () -> Unit,
     onCopy: () -> Unit,
@@ -131,9 +148,9 @@ private fun TransportScreen(
     ) {
       Text("Display Transport Test", style = MaterialTheme.typography.headlineMedium,
           fontWeight = FontWeight.Bold)
-      Text("Delivery compatibility checks", style = MaterialTheme.typography.titleMedium)
+      Text("Bounded live camera experiment", style = MaterialTheme.typography.titleMedium)
       Text(
-          "These silent 20-second tests compare delivery without a declared final file size. They use bundled test footage; camera capture comes after these checks.",
+          "First check the test footage, then try your phone's rear camera. Each experiment ends after 20 video fragments, about 20 seconds. Keep this app open.",
           style = MaterialTheme.typography.bodyLarge,
       )
       Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
@@ -158,30 +175,55 @@ private fun TransportScreen(
         }
       }
       SourceCard(
-          title = "1 · Direct stream",
-          description = "Send the clip gradually as raw media bytes. The connection closes when this finite test finishes.",
-          button = "Play direct stream",
+          title = "1 · Bounded video control",
+          description = "Play silent test footage with the same fixed byte budget planned for the camera. Check that the picture moves smoothly in your glasses.",
+          button = "Play bounded control",
           enabled = state.canStart && !state.busy,
-          onClick = { onStart(TestMode.PACED_CLOSE) },
+          onClick = { onStart(TestMode.PADDED_CONTROL) },
       )
       SourceCard(
-          title = "2 · Compatibility stream",
-          description = "Send the same gradual stream using an older HTTP response version for comparison.",
-          button = "Play compatibility stream",
+          title = "2 · Live phone camera",
+          description = if (cameraPermissionGranted) {
+            "Point the rear camera at a clock or moving object. Start the test and check your glasses. Silent video; no recording file is saved."
+          } else {
+            "Allow Camera access, then tap Start live camera test. Capture runs while this app is open and stops when the test ends or you tap Stop."
+          },
+          button = if (cameraPermissionGranted) "Start live camera test" else "Allow camera for live test",
           enabled = state.canStart && !state.busy,
-          onClick = { onStart(TestMode.PACED_CLOSE_HTTP10) },
-      )
-      SourceCard(
-          title = "3 · Chunked control",
-          description = "Send the clip immediately using chunked delivery. This compares framing with the earlier gradual chunked test.",
-          button = "Play chunked control",
-          enabled = state.canStart && !state.busy,
-          onClick = { onStart(TestMode.CHUNKED_FILE) },
+          onClick = { if (cameraPermissionGranted) onStart(TestMode.LIVE_CAMERA) else onCameraPermission() },
       )
       TextButton(onClick = { showBaseline = !showBaseline }) {
         Text(if (showBaseline) "Hide earlier transport tests" else "Show earlier transport tests")
       }
       if (showBaseline) {
+        SourceCard(
+            title = "Known length without ranges",
+            description = "Compare the successful gradual clip while disabling byte ranges. This checks the remaining difference from the failed unknown-length tests.",
+            button = "Play length control",
+            enabled = state.canStart && !state.busy,
+            onClick = { onStart(TestMode.KNOWN_LENGTH_NO_RANGES) },
+        )
+        SourceCard(
+            title = "Direct stream",
+            description = "Earlier gradual raw media without a declared file size.",
+            button = "Play direct stream",
+            enabled = state.canStart && !state.busy,
+            onClick = { onStart(TestMode.PACED_CLOSE) },
+        )
+        SourceCard(
+            title = "Compatibility stream",
+            description = "Earlier gradual raw media with an HTTP/1.0 response.",
+            button = "Play compatibility stream",
+            enabled = state.canStart && !state.busy,
+            onClick = { onStart(TestMode.PACED_CLOSE_HTTP10) },
+        )
+        SourceCard(
+            title = "Chunked control",
+            description = "Earlier immediate chunked delivery without a declared file size.",
+            button = "Play chunked control",
+            enabled = state.canStart && !state.busy,
+            onClick = { onStart(TestMode.CHUNKED_FILE) },
+        )
         SourceCard(
             title = "Direct control",
             description = "Send the raw media immediately without a declared length, then close the connection.",
@@ -249,6 +291,8 @@ private fun TransportScreen(
           Text("Source: ${state.currentMode}")
           Text("Player: ${state.playerState}")
           Text("Phone clip requests: ${state.httpRequests} · bytes sent: ${state.httpBytes}")
+          Text(state.cameraEvidence)
+          if (state.boundedEvidence.isNotEmpty()) Text(state.boundedEvidence)
           Text(state.streamEvidence, fontWeight = FontWeight.SemiBold)
           Text("Confirm playback by looking in the glasses. A player status alone does not confirm what you saw.",
               style = MaterialTheme.typography.bodySmall)

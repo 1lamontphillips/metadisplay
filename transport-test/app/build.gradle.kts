@@ -13,8 +13,8 @@ android {
     applicationId = "com.lamontphillips.metadisplay.transporttest"
     minSdk = 31
     targetSdk = 36
-    versionCode = 3
-    versionName = "0.3-delivery-check"
+    versionCode = 4
+    versionName = "0.4-live-camera-test"
     manifestPlaceholders["mwdat_application_id"] = "0"
     manifestPlaceholders["mwdat_client_token"] = "0"
   }
@@ -36,4 +36,5 @@ dependencies {
   implementation(libs.androidx.material3)
   implementation(libs.mwdat.core)
   implementation(libs.mwdat.display)
+  implementation("androidx.media3:media3-muxer:1.11.1")
 }

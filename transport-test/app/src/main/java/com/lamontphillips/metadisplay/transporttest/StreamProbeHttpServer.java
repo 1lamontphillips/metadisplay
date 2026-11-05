@@ -39,7 +39,7 @@ public final class StreamProbeHttpServer implements AutoCloseable {
   private static final int QUEUE_SIZE = 8;
 
   public enum Delivery {
-    FILE, PACED_FILE, PACED_CHUNKED, CHUNKED_FILE,
+    FILE, PACED_FILE, PACED_FILE_NO_RANGES, PACED_CHUNKED, CHUNKED_FILE,
     CLOSE_FILE, PACED_CLOSE, PACED_CLOSE_HTTP10
   }
   public enum Phase { STARTED, PROGRESS, COMPLETE }
@@ -260,11 +260,13 @@ public final class StreamProbeHttpServer implements AutoCloseable {
   }
 
   private boolean isUnknownLength() {
-    return delivery != Delivery.FILE && delivery != Delivery.PACED_FILE;
+    return delivery != Delivery.FILE && delivery != Delivery.PACED_FILE
+        && delivery != Delivery.PACED_FILE_NO_RANGES;
   }
 
   private boolean isPaced() {
-    return delivery == Delivery.PACED_FILE || delivery == Delivery.PACED_CHUNKED
+    return delivery == Delivery.PACED_FILE || delivery == Delivery.PACED_FILE_NO_RANGES
+        || delivery == Delivery.PACED_CHUNKED
         || delivery == Delivery.PACED_CLOSE || delivery == Delivery.PACED_CLOSE_HTTP10;
   }
 
@@ -307,11 +309,12 @@ public final class StreamProbeHttpServer implements AutoCloseable {
       requestCount.incrementAndGet();
       boolean unknownLength = isUnknownLength();
       boolean chunked = "CHUNKED".equals(request.framing);
-      request.rangeIgnored = unknownLength && range != null;
-      long[] selected = selectRange(unknownLength ? null : range);
+      boolean supportsRanges = !unknownLength && delivery != Delivery.PACED_FILE_NO_RANGES;
+      request.rangeIgnored = !supportsRanges && range != null;
+      long[] selected = selectRange(supportsRanges ? range : null);
       request.start = selected[0];
       request.end = selected[1];
-      request.status = unknownLength || range == null ? 200 : 206;
+      request.status = !supportsRanges || range == null ? 200 : 206;
       request.plannedBytes = request.end < request.start ? 0 : request.end - request.start + 1;
       if ("GET".equals(request.method)) {
         beginTransfer(request);
@@ -513,8 +516,8 @@ public final class StreamProbeHttpServer implements AutoCloseable {
       String name = line.substring(0, colon).toLowerCase(Locale.ROOT);
       String value = line.substring(colon + 1).trim();
       if ("range".equals(name)) {
-        // Repeated Range fields combine as a range set. File modes reject multiple ranges;
-        // chunked mode ignores the complete Range field, including malformed range sets.
+        // Repeated Range fields combine as a range set. Range-capable file modes reject
+        // multiple ranges; modes without seeking ignore the complete field.
         range = range == null ? value : range + "," + value;
       } else if ("transfer-encoding".equals(name)) {
         throw new HttpProblem(400, "malformed_request");
@@ -638,7 +641,8 @@ public final class StreamProbeHttpServer implements AutoCloseable {
     } else {
       headers.append("Content-Length: ").append(length).append("\r\n");
       if (status == 200 || status == 206 || status == 416) {
-        headers.append("Accept-Ranges: bytes\r\n");
+        headers.append(delivery == Delivery.PACED_FILE_NO_RANGES
+            ? "Accept-Ranges: none\r\n" : "Accept-Ranges: bytes\r\n");
       }
     }
     if (status == 200 || status == 206 || status == 416) {

@@ -12,6 +12,9 @@ enum class TestMode {
   CLOSE_FILE,
   PACED_CLOSE,
   PACED_CLOSE_HTTP10,
+  KNOWN_LENGTH_NO_RANGES,
+  PADDED_CONTROL,
+  LIVE_CAMERA,
 }
 
 data class TransportState(
@@ -28,5 +31,7 @@ data class TransportState(
     val httpRequests: Int = 0,
     val httpBytes: Long = 0,
     val streamEvidence: String = "No first-PLAYING evidence yet",
+    val cameraEvidence: String = "Camera inactive",
+    val boundedEvidence: String = "",
     val events: List<String> = emptyList(),
 )
