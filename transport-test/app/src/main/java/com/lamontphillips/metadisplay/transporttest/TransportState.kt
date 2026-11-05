@@ -32,6 +32,7 @@ data class TransportState(
     val httpBytes: Long = 0,
     val streamEvidence: String = "No first-PLAYING evidence yet",
     val cameraEvidence: String = "Camera inactive",
+    val cameraPacingEvidence: String = "",
     val boundedEvidence: String = "",
     val events: List<String> = emptyList(),
 )

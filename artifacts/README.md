@@ -1,6 +1,6 @@
 # Display Access Android sample
 
-The latest experiment is [Display Transport Test: bounded live camera 4](./DisplayTransport-live-camera-4.zip). It checks a padded finite control before offering a foreground rear-camera test with a real 20-fragment session limit. Physical camera playback remains unverified. See its [phone instructions](./DisplayTransport-live-camera-4-INSTALL.md). It updates the separate test app and keeps Display Access installed.
+The latest experiment is [Display Transport Test: camera cadence check 5](./DisplayTransport-camera-cadence-5.zip). The user confirmed a live camera scene with pauses in version 0.4; this update tests steadier frame submission while retaining the 20-fragment session limit. See its [phone instructions](./DisplayTransport-camera-cadence-5-INSTALL.md). It updates the separate test app and keeps Display Access installed.
 
 ## Diagnostic update
 

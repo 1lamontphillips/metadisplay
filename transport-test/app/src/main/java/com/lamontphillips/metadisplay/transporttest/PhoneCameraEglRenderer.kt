@@ -41,6 +41,16 @@ internal class PhoneCameraEglRenderer(
   private var vertexMatrixUniform = -1
   private val pending = AtomicBoolean()
   private val frames = AtomicLong()
+  private var hasTextureImage = false
+  private var lastTextureTimeNs = 0L
+  var freshTextureUpdates: Long = 0
+    private set
+  var repeatedFrames: Long = 0
+    private set
+  var submittedFrames: Long = 0
+    private set
+  var maxFreshFrameGapUs: Long = 0
+    private set
   private val textureMatrix = FloatArray(16)
   private val vertexMatrix = FloatArray(16)
   private val vertices = ByteBuffer.allocateDirect(8 * 4).order(ByteOrder.nativeOrder())
@@ -49,6 +59,7 @@ internal class PhoneCameraEglRenderer(
       .asFloatBuffer().apply { put(floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f)); position(0) }
 
   val capturedFrameCount: Long get() = frames.get()
+  val hasImageAvailable: Boolean get() = hasTextureImage || pending.get()
 
   fun initialize(): Surface {
     try {
@@ -117,10 +128,24 @@ internal class PhoneCameraEglRenderer(
   }
 
   fun renderNextFrame(presentationTimeNs: Long): Boolean {
-    if (!pending.getAndSet(false)) return false
     val source = checkNotNull(texture) { "CAMERA_EGL_FAILED" }
-    source.updateTexImage()
-    source.getTransformMatrix(textureMatrix)
+    var fresh = false
+    if (pending.getAndSet(false)) {
+      source.updateTexImage()
+      source.getTransformMatrix(textureMatrix)
+      val timestamp = source.timestamp
+      if (!hasTextureImage || timestamp != lastTextureTimeNs) {
+        if (hasTextureImage && timestamp > lastTextureTimeNs) {
+          maxFreshFrameGapUs = maxOf(maxFreshFrameGapUs, (timestamp - lastTextureTimeNs) / 1000)
+        }
+        lastTextureTimeNs = timestamp
+        freshTextureUpdates++
+        fresh = true
+      }
+      hasTextureImage = true
+    }
+    // Reuse the latest real camera texture between arrivals, never an uninitialized image.
+    if (!hasTextureImage) return false
     GLES20.glViewport(0, 0, width, height)
     GLES20.glClearColor(0f, 0f, 0f, 1f)
     GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
@@ -140,6 +165,8 @@ internal class PhoneCameraEglRenderer(
     check(GLES20.glGetError() == GLES20.GL_NO_ERROR) { "CAMERA_EGL_FAILED" }
     check(EGLExt.eglPresentationTimeANDROID(display, window, presentationTimeNs)) { "CAMERA_EGL_FAILED" }
     check(EGL14.eglSwapBuffers(display, window)) { "CAMERA_EGL_FAILED" }
+    submittedFrames++
+    if (!fresh) repeatedFrames++
     return true
   }
 

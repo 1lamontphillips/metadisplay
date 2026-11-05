@@ -90,6 +90,7 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
   private var firstPlaySnapshotReport = "No first SDK PLAYING snapshot captured."
   private var configuredTransportReport = "No test configured."
   private var actualTransportReport = "No stream HTTP response observed."
+  private var retainedCameraPacing: PhoneCameraProducer.PacingSnapshot? = null
   private val reportStart = SystemClock.elapsedRealtime()
   private val connectivity = app.getSystemService(ConnectivityManager::class.java)
 
@@ -284,10 +285,13 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
           streamEvidence = if (isStreamMode(mode) || isBoundedMode(mode))
               "Awaiting first SDK PLAYING snapshot." else "File control; no stream transfer snapshot.",
           cameraEvidence = if (mode == TestMode.LIVE_CAMERA) "Camera starting" else "Camera inactive",
+          cameraPacingEvidence = if (mode == TestMode.LIVE_CAMERA)
+              "Camera pacing metrics awaiting frames" else "",
           boundedEvidence = if (isBoundedMode(mode))
               "Finite experiment: ${LiveVideoConfig.FRAGMENTS} slots, ${LiveVideoConfig.SLOT_BYTES} bytes each; awaiting initialization."
               else "")
       firstPlaySnapshotReport = "No first SDK PLAYING snapshot captured."
+      retainedCameraPacing = null
       configuredTransportReport = configuredTransport(mode)
       actualTransportReport = "No stream HTTP response observed."
       record("Test ${run.number}: ${mode.name}; " + if (mode == TestMode.LIVE_CAMERA)
@@ -594,7 +598,8 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
         "CAMERA_COMPLETE", "CAMERA_STOPPED", "CAMERA_PERMISSION_REQUIRED", "NO_REAR_CAMERA",
         "NO_AVC_ENCODER", "CAMERA_OPEN_FAILED", "CAMERA_CONFIGURE_FAILED", "CAMERA_EGL_FAILED",
         "CAMERA_CODEC_FAILED", "CAMERA_MUXER_FAILED", "CAMERA_INIT_TIMEOUT",
-        "CAMERA_FRAME_TIMEOUT", "CAMERA_FRAME_STALLED", "CAMERA_SLOT_TIMEOUT", "CAMERA_INTERRUPTED",
+        "CAMERA_FRAME_TIMEOUT", "CAMERA_FRAME_STALLED", "CAMERA_PACING_STALLED",
+        "CAMERA_SLOT_TIMEOUT", "CAMERA_INTERRUPTED",
         "CAMERA_CLEANUP_FAILED", "CAMERA_FAILED")
     return if (value in codes) value else "CAMERA_FAILED"
   }
@@ -621,6 +626,10 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
         event.completedFragments, event.width, event.height)
     _state.value = _state.value.copy(cameraEvidence = summary)
     record("Camera $kind: $code; $summary")
+    retainCameraPacing(event.pacing)
+    if (kind in setOf("PROGRESS", "COMPLETE", "FAILED")) {
+      record("Camera pacing $kind: ${_state.value.cameraPacingEvidence}")
+    }
     refreshBoundedEvidence(run)
     if (kind == "FAILED") {
       finish(run, "Camera source failed", code)
@@ -645,7 +654,41 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
     _state.value = _state.value.copy(cameraEvidence = cameraSummary(snapshot.state,
         snapshot.capturedFrames, snapshot.encodedFrames, snapshot.completedFragments,
         snapshot.width, snapshot.height))
+    retainCameraPacing(snapshot.pacing)
   }
+
+  private fun retainCameraPacing(value: PhoneCameraProducer.PacingSnapshot) {
+    // Event callbacks and final cleanup snapshots can arrive at different times. Counters
+    // and maxima remain monotonic within this run, including failure before SDK PLAYING.
+    val kept = safePacing(value, retainedCameraPacing)
+    retainedCameraPacing = kept
+    _state.value = _state.value.copy(cameraPacingEvidence = pacingSummary(kept))
+  }
+
+  private fun safePacing(value: PhoneCameraProducer.PacingSnapshot,
+      old: PhoneCameraProducer.PacingSnapshot? = null): PhoneCameraProducer.PacingSnapshot =
+      value.copy(
+        submittedFrames = maxOf(0L, value.submittedFrames, old?.submittedFrames ?: 0L),
+        freshTextureUpdates = maxOf(0L, value.freshTextureUpdates, old?.freshTextureUpdates ?: 0L),
+        repeatedFrames = maxOf(0L, value.repeatedFrames, old?.repeatedFrames ?: 0L),
+        skippedTicks = maxOf(0L, value.skippedTicks, old?.skippedTicks ?: 0L),
+        maxFreshFrameGapUs = maxOf(0L, value.maxFreshFrameGapUs, old?.maxFreshFrameGapUs ?: 0L),
+        maxRenderLatenessUs = maxOf(0L, value.maxRenderLatenessUs, old?.maxRenderLatenessUs ?: 0L),
+        maxRenderWorkUs = maxOf(0L, value.maxRenderWorkUs, old?.maxRenderWorkUs ?: 0L),
+        maxCodecPtsGapUs = maxOf(0L, value.maxCodecPtsGapUs, old?.maxCodecPtsGapUs ?: 0L),
+        maxKeyframePtsGapUs = maxOf(0L, value.maxKeyframePtsGapUs, old?.maxKeyframePtsGapUs ?: 0L),
+        maxFragmentGapUs = maxOf(0L, value.maxFragmentGapUs, old?.maxFragmentGapUs ?: 0L),
+        maxDrainWorkUs = maxOf(0L, value.maxDrainWorkUs, old?.maxDrainWorkUs ?: 0L),
+        maxMuxWriteUs = maxOf(0L, value.maxMuxWriteUs, old?.maxMuxWriteUs ?: 0L),
+    )
+
+  private fun pacingSummary(p: PhoneCameraProducer.PacingSnapshot): String =
+      "submittedFrames=${p.submittedFrames}, freshTextureUpdates=${p.freshTextureUpdates}, " +
+          "repeatedFrames=${p.repeatedFrames}, skippedTicks=${p.skippedTicks}, " +
+          "maxFreshFrameGapUs=${p.maxFreshFrameGapUs}, maxRenderLatenessUs=${p.maxRenderLatenessUs}, " +
+          "maxRenderWorkUs=${p.maxRenderWorkUs}, maxCodecPtsGapUs=${p.maxCodecPtsGapUs}, " +
+          "maxKeyframePtsGapUs=${p.maxKeyframePtsGapUs}, maxFragmentGapUs=${p.maxFragmentGapUs}, " +
+          "maxDrainWorkUs=${p.maxDrainWorkUs}, maxMuxWriteUs=${p.maxMuxWriteUs}"
 
   private fun boundedSummary(produced: Long, planned: Long, fragments: Int,
       complete: Boolean): String =
@@ -751,9 +794,16 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
         if (isCurrent(run)) {
           // Read the server's atomic live snapshot before logging or yielding. Queued
           // HTTP progress events are deliberately not used for this timing evidence.
+          val cameraContext = if (run.mode == TestMode.LIVE_CAMERA &&
+              value in setOf(VideoPlayerState.IDLE, VideoPlayerState.PLAYING)) {
+            captureCameraPlaybackContext(run)
+          } else null
+          cameraContext?.camera?.let { retainCameraSnapshot(it) }
           if (value == VideoPlayerState.PLAYING && !run.firstPlayCaptured) {
-            captureFirstPlaying(run)
+            if (cameraContext != null) captureFirstPlaying(run, cameraContext.transfer)
+            else captureFirstPlaying(run)
           }
+          if (cameraContext != null) recordCameraPlaybackContext(run, value, cameraContext)
           record("Video state: ${value.name}")
           _state.value = _state.value.copy(playerState = value.name)
           when (value) {
@@ -813,6 +863,46 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
       val sourceBytesProduced: Long? = null,
   )
 
+  private data class CameraPlaybackContext(
+      val transfer: TransferEvidence?,
+      val camera: PhoneCameraProducer.Snapshot?,
+  )
+
+  private fun captureCameraPlaybackContext(run: TestRun): CameraPlaybackContext {
+    val transfer = transferEvidence(run.streamServer, run.liveServer)
+    val camera = try { run.cameraProducer?.snapshot() } catch (_: Exception) { null }
+    return CameraPlaybackContext(transfer, camera)
+  }
+
+  private fun recordCameraPlaybackContext(run: TestRun, value: VideoPlayerState,
+      context: CameraPlaybackContext) {
+    val transfer = context.transfer
+    val source = if (transfer == null) {
+      "HTTP snapshot unavailable"
+    } else {
+      val initializationBytes = run.streamAssetBytes -
+          LiveVideoConfig.FRAGMENTS.toLong() * LiveVideoConfig.SLOT_BYTES
+      val slots = (((transfer.sourceBytesProduced ?: 0L) - initializationBytes)
+          .coerceAtLeast(0L) / LiveVideoConfig.SLOT_BYTES)
+          .coerceAtMost(LiveVideoConfig.FRAGMENTS.toLong())
+      "transfer=${transfer.id}, sourceBytesProduced=${transfer.sourceBytesProduced ?: 0L}, " +
+          "completeSlotsProduced=$slots/${LiveVideoConfig.FRAGMENTS}, " +
+          "bytesSent=${transfer.bytesSent}/${transfer.plannedBytes}, " +
+          "payloadComplete=${transfer.payloadComplete}, responseComplete=${transfer.responseComplete}, " +
+          "writeInProgress=${transfer.writeInProgress}, status=${transfer.status}, " +
+          "activeGetCount=${transfer.activeGetCount}, totalGetCount=${transfer.totalGetCount}"
+    }
+    val camera = context.camera
+    val producer = if (camera == null) "Camera snapshot unavailable" else {
+      cameraSummary(camera.state, camera.capturedFrames, camera.encodedFrames,
+          camera.completedFragments, camera.width, camera.height)
+    }
+    record("SDK ${value.name} source context: $source; $producer")
+    if (camera != null) {
+      record("SDK ${value.name} camera pacing: ${pacingSummary(safePacing(camera.pacing))}")
+    }
+  }
+
   private fun transferEvidence(
       streamServer: StreamProbeHttpServer?,
       liveServer: LiveClipHttpServer?,
@@ -842,9 +932,9 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
     }
   }
 
-  private fun captureFirstPlaying(run: TestRun) {
+  private fun captureFirstPlaying(run: TestRun,
+      snapshot: TransferEvidence? = transferEvidence(run.streamServer, run.liveServer)) {
     run.firstPlayCaptured = true
-    val snapshot = transferEvidence(run.streamServer, run.liveServer)
     if (snapshot == null) {
       firstPlaySnapshotReport = "First SDK PLAYING observed in ${run.mode.name}; " +
           "this file control has no stream transfer snapshot."
@@ -1258,12 +1348,13 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
   fun copyReport(): String {
     val snapshot = _state.value
     return buildString {
-      appendLine("MetaDisplay bounded live camera experiment 0.4; SDK 1.0.1")
+      appendLine("MetaDisplay bounded live camera experiment 0.5; SDK 1.0.1")
       appendLine("LIVE_CAMERA uses the phone rear camera only while this app is visible; controls use public fixtures.")
       appendLine("Silent, finite ${LiveVideoConfig.FRAGMENTS}-fragment experiment (roughly 20 seconds), not indefinite streaming.")
       appendLine("Exact response budget: initialization plus ${LiveVideoConfig.FRAGMENTS} valid ${LiveVideoConfig.SLOT_BYTES}-byte fragment slots; no estimated Content-Length.")
       appendLine("Camera media stays in bounded temporary memory; no microphone or disk recording.")
       appendLine("SDK PLAYING/ENDED does not confirm visible playback in glasses.")
+      appendLine("Camera cadence counters measure producer timing; SDK IDLE/PLAYING does not identify buffering or visible latency.")
       appendLine("Addresses, URL tokens, device names/IDs and credentials are omitted.")
       appendLine("Registration: ${snapshot.registration}")
       appendLine("Device: $reportDeviceStatus")
@@ -1275,6 +1366,9 @@ class TransportViewModel(application: Application) : AndroidViewModel(applicatio
       cleanupBlockReason?.let { appendLine("Cleanup block details: $it") }
       appendLine("Phone HTTP requests: ${snapshot.httpRequests}; bytes: ${snapshot.httpBytes}")
       appendLine("Camera: ${snapshot.cameraEvidence}")
+      if (snapshot.cameraPacingEvidence.isNotEmpty()) {
+        appendLine("Camera pacing: ${snapshot.cameraPacingEvidence}")
+      }
       if (snapshot.boundedEvidence.isNotEmpty()) appendLine(snapshot.boundedEvidence)
       appendLine("Stream evidence: ${snapshot.streamEvidence}")
       appendLine(firstPlaySnapshotReport)

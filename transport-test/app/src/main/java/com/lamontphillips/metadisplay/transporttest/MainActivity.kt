@@ -148,9 +148,9 @@ private fun TransportScreen(
     ) {
       Text("Display Transport Test", style = MaterialTheme.typography.headlineMedium,
           fontWeight = FontWeight.Bold)
-      Text("Bounded live camera experiment", style = MaterialTheme.typography.titleMedium)
+      Text("Camera cadence check", style = MaterialTheme.typography.titleMedium)
       Text(
-          "First check the test footage, then try your phone's rear camera. Each experiment ends after 20 video fragments, about 20 seconds. Keep this app open.",
+          "This update tests steadier camera frame pacing. Each experiment ends after 20 video fragments, about 20 seconds. Keep this app open.",
           style = MaterialTheme.typography.bodyLarge,
       )
       Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
@@ -292,6 +292,7 @@ private fun TransportScreen(
           Text("Player: ${state.playerState}")
           Text("Phone clip requests: ${state.httpRequests} · bytes sent: ${state.httpBytes}")
           Text(state.cameraEvidence)
+          if (state.cameraPacingEvidence.isNotEmpty()) Text(state.cameraPacingEvidence)
           if (state.boundedEvidence.isNotEmpty()) Text(state.boundedEvidence)
           Text(state.streamEvidence, fontWeight = FontWeight.SemiBold)
           Text("Confirm playback by looking in the glasses. A player status alone does not confirm what you saw.",

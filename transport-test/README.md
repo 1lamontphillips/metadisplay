@@ -1,10 +1,12 @@
 # Display Transport Test
 
-A side-by-side Android experiment for phone-hosted MP4 playback in Meta Ray-Ban Display glasses. Smooth progressive playback of a known-length fragmented MP4 has been confirmed on the user's glasses. Version 0.4 adds a bounded rear-camera producer through that route; physical camera playback and latency remain unverified.
+A side-by-side Android experiment for phone-hosted MP4 playback in Meta Ray-Ban Display glasses. The user confirmed a live rear-camera scene in version 0.4, with pauses and about two seconds of delay; the padded fixture control was smooth. Version 0.5 tests anchored camera frame pacing and adds bounded timing measurements. Visible improvement remains unverified.
 
 This test has a distinct application ID and installs alongside Display Access. It uses Meta's documented Developer Mode values of `0` and needs its own app registration.
 
-Version 0.4 first checks a progressively produced padded fixture, then offers Camera2 → EGL scaling/rotation → MediaCodec AVC → public Media3 fragmented MP4 muxer → bounded phone-loopback HTTP delivery. Twenty 65,536-byte fragment slots give the response an exact length, independent of variable encoded sample sizes. Valid MP4 `free` boxes fill unused slot space; absolute fragment offsets must be rebased. Overflow or invalid container structure fails explicitly. See [the device test guide](../artifacts/DisplayTransport-live-camera-4-INSTALL.md).
+The camera path is Camera2 → EGL scaling/rotation → MediaCodec AVC → public Media3 fragmented MP4 muxer → bounded phone-loopback HTTP delivery. Twenty 65,536-byte fragment slots give the response an exact length, independent of variable encoded sample sizes. Valid MP4 `free` boxes fill unused slot space; absolute fragment offsets are rebased. Overflow or invalid container structure fails explicitly. See [the current device test guide](../artifacts/DisplayTransport-camera-cadence-5-INSTALL.md).
+
+Version 0.5 anchors encoder submission to a 24-Hz timeline after the first real camera image, retaining the latest texture between fresh camera deliveries. It skips overdue ticks without compressing elapsed time or creating unlimited catch-up bursts. Timing counters distinguish source, render, codec and fragment-release gaps. This addresses a concrete cadence weakness; it does not prove a universal variable-frame-rate limitation in the glasses player. Transport, GOP, muxer threshold and session budget stay as in 0.4.
 
 Camera use is explicit, foreground-only and silent. The response cache has a fixed memory bound and is cleared on cleanup; no camera file is saved. The source stops at the fragment limit or on Stop/background/failure. This is a finite live experiment, not seamless indefinite streaming. The optional known-length/no-range control checks the remaining seekability difference from the failed variants.
 

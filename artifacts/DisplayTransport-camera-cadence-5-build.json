@@ -1,0 +1,53 @@
+{
+  "application_id": "com.lamontphillips.metadisplay.transporttest",
+  "version_code": 5,
+  "version": "0.5-camera-cadence",
+  "sdk": "1.0.1",
+  "media3_muxer": "1.11.1",
+  "apk_sha256": "09e72604917a1d10733f73eb21ab0687826a080864d617093ea3357de0f2db66",
+  "zip_sha256": "388cc50053a98a95b921f372b98d617588334d34dd20ec9f604b21368d18731d",
+  "zip_bytes": 23130148,
+  "camera_session": {
+    "fragment_slots": 20,
+    "slot_bytes": 65536,
+    "target_width": 266,
+    "target_height": 150,
+    "target_fps": 24,
+    "target_bitrate": 120000,
+    "overall_limit_seconds": 75,
+    "length": "Exact initialization bytes plus20 fixed slots; real finite limit, no estimated Content-Length"
+  },
+  "change": "Anchored24Hz latest-texture submission; rational scheduled PTS with elapsed gaps on skipped ticks;500ms raw-lateness guard;12 bounded numeric pacing metrics. Existing GOP/muxer/HTTP/slot/FPS limits retained.",
+  "checks": {
+    "host_cases": {
+      "ClipHttpServer": 39,
+      "StreamProbeHttpServer": 60,
+      "FixedBudgetMedia": 60,
+      "LiveClipHttpServer": 30,
+      "CameraFramePacer": 29,
+      "total": 218,
+      "failed": 0
+    },
+    "final_debug_build": "passed",
+    "lint": {
+      "errors": 0,
+      "warnings": 4
+    },
+    "apk_signature": "verified; same certificate as earlier transport builds",
+    "permissions": "CAMERA present; microphone and external/media storage permissions absent",
+    "assets": "all three fixtures match source and are unchanged from0.4",
+    "unchanged_mp4_pipeline_source_hashes": {
+      "FixedBudgetMp4.java": "dce7ccefccbdfb86755a9c16b83efc02f6f5426772df6fd07cbd6ef6be9e6824",
+      "BoundedMediaBuffer.java": "d459e253ed5ac3696b0b8f34b5bf834a9764abaabc195ff00b94e5e7ce13b9dc"
+    },
+    "actual_media3_validation": "Carried forward for unchanged MP4 parser/buffer:480 frames and timestamps preserved,20 absolute offsets rebased,exact length. Host VFR experiments establish possible boundary-timing drift, not the phone freeze cause.",
+    "independent_review": "pacer rational math, first-image gating, retained texture, elapsed skipped ticks, failure guard, cleanup and report privacy reviewed",
+    "camera_change_source_sha256": {
+      "CameraFramePacer.java": "44c605b164a1c603051f3efd63a0fa17818aaa19e69d6d557e6e57f78dea9c25",
+      "PhoneCameraProducer.kt": "5a8eafb89879ae3624961f18c5954c8940c576a24518797bc90a898da6329fc3",
+      "PhoneCameraEglRenderer.kt": "d99483f12397f863664288f48e0bc71e513cd953581b46517bc1b22a8a66e40d",
+      "TransportViewModel.kt": "54cd39eaaaf161a28a2b5e299481a116bc69f96f3c94a1edaeabf77384285b7e"
+    }
+  },
+  "limits": "Version0.4 visibly showed live camera with pauses and approximately2s user-observed delay; padded control was smooth. Version0.5 visible improvement and latency remain unverified. Producer counters do not measure glass-to-glass delay. Finite20-fragment experiment, not indefinite streaming."
+}

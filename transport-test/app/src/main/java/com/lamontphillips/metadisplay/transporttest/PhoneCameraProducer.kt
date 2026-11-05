@@ -42,6 +42,21 @@ class PhoneCameraProducer(
     private val displayRotation: Int,
     private val listener: Consumer<Event>,
 ) : AutoCloseable {
+  data class PacingSnapshot(
+      val submittedFrames: Long = 0,
+      val freshTextureUpdates: Long = 0,
+      val repeatedFrames: Long = 0,
+      val skippedTicks: Long = 0,
+      val maxFreshFrameGapUs: Long = 0,
+      val maxRenderLatenessUs: Long = 0,
+      val maxRenderWorkUs: Long = 0,
+      val maxCodecPtsGapUs: Long = 0,
+      val maxKeyframePtsGapUs: Long = 0,
+      val maxFragmentGapUs: Long = 0,
+      val maxDrainWorkUs: Long = 0,
+      val maxMuxWriteUs: Long = 0,
+  )
+
   data class Event(
       val kind: String,
       val code: String,
@@ -50,6 +65,7 @@ class PhoneCameraProducer(
       val completedFragments: Int,
       val width: Int,
       val height: Int,
+      val pacing: PacingSnapshot = PacingSnapshot(),
   )
 
   data class Snapshot(
@@ -59,6 +75,7 @@ class PhoneCameraProducer(
       val completedFragments: Int,
       val width: Int,
       val height: Int,
+      val pacing: PacingSnapshot = PacingSnapshot(),
   )
 
   private companion object {
@@ -69,6 +86,7 @@ class PhoneCameraProducer(
     const val INIT_TIMEOUT_NS = 4_000_000_000L
     const val FRAGMENT_TIMEOUT_NS = 5_000_000_000L
     const val TOTAL_TIMEOUT_NS = 35_000_000_000L
+    const val PACING_STALL_NS = 500_000_000L
   }
 
   private class CameraFailure(val code: String) : RuntimeException(code)
@@ -82,6 +100,15 @@ class PhoneCameraProducer(
 
   private data class EncoderChoice(val codec: MediaCodec, val surface: Surface)
 
+  private class PacingTimings {
+    var maxRenderWorkNs = 0L
+    var maxCodecPtsGapUs = 0L
+    var maxKeyframePtsGapUs = 0L
+    var maxFragmentGapNs = 0L
+    var maxDrainWorkNs = 0L
+    var maxMuxWriteNs = 0L
+  }
+
   private val app = context.applicationContext
   private val lifecycle = Any()
   private val stopping = AtomicBoolean()
@@ -92,6 +119,7 @@ class PhoneCameraProducer(
   private val captured = AtomicLong()
   private val encoded = AtomicLong()
   private val completed = AtomicInteger()
+  private val pacing = AtomicReference(PacingSnapshot())
   private val asynchronousFailure = AtomicReference<String?>(null)
   private val camera = AtomicReference<CameraDevice?>(null)
   private val cameraSession = AtomicReference<CameraCaptureSession?>(null)
@@ -114,16 +142,37 @@ class PhoneCameraProducer(
   }
 
   fun snapshot(): Snapshot = Snapshot(status.get(), captured.get(), encoded.get(), completed.get(),
-      LiveVideoConfig.WIDTH, LiveVideoConfig.HEIGHT)
+      LiveVideoConfig.WIDTH, LiveVideoConfig.HEIGHT, pacing.get())
 
   private fun event(kind: String, code: String) {
     val value = snapshot()
     try {
       listener.accept(Event(kind, code, value.capturedFrames, value.encodedFrames,
-          value.completedFragments, value.width, value.height))
+          value.completedFragments, value.width, value.height, value.pacing))
     } catch (_: RuntimeException) {
       // The caller's UI callback cannot interrupt camera cleanup or expose frame data.
     }
+  }
+
+  private fun publishPacing(
+      renderer: PhoneCameraEglRenderer?,
+      pacer: CameraFramePacer,
+      timings: PacingTimings,
+  ) {
+    pacing.set(PacingSnapshot(
+        submittedFrames = renderer?.submittedFrames ?: 0,
+        freshTextureUpdates = renderer?.freshTextureUpdates ?: 0,
+        repeatedFrames = renderer?.repeatedFrames ?: 0,
+        skippedTicks = pacer.skippedTicks,
+        maxFreshFrameGapUs = renderer?.maxFreshFrameGapUs ?: 0,
+        maxRenderLatenessUs = pacer.maxLatenessNs / 1000,
+        maxRenderWorkUs = timings.maxRenderWorkNs / 1000,
+        maxCodecPtsGapUs = timings.maxCodecPtsGapUs,
+        maxKeyframePtsGapUs = timings.maxKeyframePtsGapUs,
+        maxFragmentGapUs = timings.maxFragmentGapNs / 1000,
+        maxDrainWorkUs = timings.maxDrainWorkNs / 1000,
+        maxMuxWriteUs = timings.maxMuxWriteNs / 1000,
+    ))
   }
 
   private fun fail(code: String) {
@@ -143,6 +192,8 @@ class PhoneCameraProducer(
     var muxer: FragmentedMp4Muxer? = null
     var quotaComplete = false
     var encoderStarted = false
+    val pacer = CameraFramePacer(LiveVideoConfig.FPS, PACING_STALL_NS)
+    val timings = PacingTimings()
     var stage = "CAMERA_FAILED"
     try {
       if (stopping.get()) return
@@ -167,8 +218,9 @@ class PhoneCameraProducer(
           displayRotation, callbackHandler)
       val cameraInput = renderer.initialize()
       stage = "CAMERA_MUXER_FAILED"
-      parser = FixedBudgetMp4(LiveVideoConfig.FRAGMENTS, LiveVideoConfig.SLOT_BYTES, buffer)
-      muxer = FragmentedMp4Muxer.Builder(parser).setFragmentDurationMs(500)
+      val activeParser = FixedBudgetMp4(LiveVideoConfig.FRAGMENTS, LiveVideoConfig.SLOT_BYTES, buffer)
+      parser = activeParser
+      muxer = FragmentedMp4Muxer.Builder(activeParser).setFragmentDurationMs(500)
           .setSampleCopyingEnabled(true).build()
       stage = "CAMERA_CODEC_FAILED"
       encoder.start()
@@ -189,8 +241,6 @@ class PhoneCameraProducer(
       status.set("RUNNING")
       event("STATE", "CAMERA_RUNNING")
       val began = System.nanoTime()
-      val framePeriod = 1_000_000_000L / LiveVideoConfig.FPS
-      var nextRender = began
       var lastFrame = began
       var lastProgress = began
       var lastFragment = began
@@ -199,6 +249,19 @@ class PhoneCameraProducer(
       var track = -1
       var firstPts: Long? = null
       var lastPts = -1L
+      var lastKeyframePts: Long? = null
+      fun observeFragmentRelease() {
+        val slots = activeParser.emittedSlots
+        completed.set(slots)
+        if (slots != previousFragments) {
+          val releasedAt = System.nanoTime()
+          if (previousFragments > 0) {
+            timings.maxFragmentGapNs = maxOf(timings.maxFragmentGapNs, releasedAt - lastFragment)
+          }
+          lastFragment = releasedAt
+          previousFragments = slots
+        }
+      }
       val info = MediaCodec.BufferInfo()
       while (!stopping.get() && !parser.isComplete) {
         asynchronousFailure.get()?.let { throw CameraFailure(it) }
@@ -215,80 +278,107 @@ class PhoneCameraProducer(
           throw CameraFailure("CAMERA_SLOT_TIMEOUT")
         }
         stage = "CAMERA_EGL_FAILED"
-        if (now >= nextRender) {
-          renderer.renderNextFrame(now - began)
-          // Never catch up by queuing a burst of old frames after a slow operation.
-          nextRender = now + framePeriod
+        // The first real image establishes the clock. Warmup never produces black frames
+        // or counts as a missed render deadline.
+        if (!pacer.isStarted && renderer.hasImageAvailable) pacer.start(now)
+        val tick = pacer.poll(now)
+        if (tick != null) {
+          if (tick.stalled) throw CameraFailure("CAMERA_PACING_STALLED")
+          val renderBegan = System.nanoTime()
+          try {
+            renderer.renderNextFrame(tick.presentationTimeNs)
+          } finally {
+            timings.maxRenderWorkNs = maxOf(timings.maxRenderWorkNs, System.nanoTime() - renderBegan)
+          }
         }
         stage = "CAMERA_CODEC_FAILED"
         var drained = 0
-        while (!stopping.get() && !parser.isComplete && drained++ < 64) {
-          when (val index = encoder.dequeueOutputBuffer(info, 0)) {
-            MediaCodec.INFO_TRY_AGAIN_LATER -> break
-            MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-              if (track >= 0) throw CameraFailure("CAMERA_CODEC_FAILED")
-              val format = encoder.outputFormat
-              if (format.containsKey(MediaFormat.KEY_MAX_B_FRAMES) &&
-                  format.getInteger(MediaFormat.KEY_MAX_B_FRAMES) > 0) {
-                throw CameraFailure("CAMERA_CODEC_FAILED")
-              }
-              stage = "CAMERA_MUXER_FAILED"
-              track = muxer.addTrack(muxerFormat(format))
-              stage = "CAMERA_CODEC_FAILED"
-            }
-            else -> if (index >= 0) {
-              try {
-                if (info.size > 0 && info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
-                  if (track < 0) throw CameraFailure("CAMERA_CODEC_FAILED")
-                  val bytes = encoder.getOutputBuffer(index)
-                      ?: throw CameraFailure("CAMERA_CODEC_FAILED")
-                  bytes.position(info.offset)
-                  bytes.limit(info.offset + info.size)
-                  val origin = firstPts ?: info.presentationTimeUs.also { firstPts = it }
-                  val pts = info.presentationTimeUs - origin
-                  if (pts < 0 || pts <= lastPts) throw CameraFailure("CAMERA_CODEC_FAILED")
-                  lastPts = pts
-                  val normalized = MediaCodec.BufferInfo().apply {
-                    set(0, info.size, pts, info.flags)
-                  }
-                  stage = "CAMERA_MUXER_FAILED"
-                  try {
-                    muxer.writeSampleData(track, bytes.slice(),
-                        MuxerUtil.getMuxerBufferInfoFromMediaCodecBufferInfo(normalized))
-                  } catch (_: Exception) {
-                    throw CameraFailure("CAMERA_MUXER_FAILED")
-                  }
-                  encoded.incrementAndGet()
+        val encodedBeforeDrain = encoded.get()
+        val drainBegan = System.nanoTime()
+        try {
+          while (!stopping.get() && !parser.isComplete && drained++ < 64) {
+            when (val index = encoder.dequeueOutputBuffer(info, 0)) {
+              MediaCodec.INFO_TRY_AGAIN_LATER -> break
+              MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                if (track >= 0) throw CameraFailure("CAMERA_CODEC_FAILED")
+                val format = encoder.outputFormat
+                if (format.containsKey(MediaFormat.KEY_MAX_B_FRAMES) &&
+                    format.getInteger(MediaFormat.KEY_MAX_B_FRAMES) > 0) {
+                  throw CameraFailure("CAMERA_CODEC_FAILED")
                 }
-              } finally {
+                stage = "CAMERA_MUXER_FAILED"
+                track = muxer.addTrack(muxerFormat(format))
                 stage = "CAMERA_CODEC_FAILED"
-                encoder.releaseOutputBuffer(index, false)
+              }
+              else -> if (index >= 0) {
+                try {
+                  if (info.size > 0 && info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
+                    if (track < 0) throw CameraFailure("CAMERA_CODEC_FAILED")
+                    val bytes = encoder.getOutputBuffer(index)
+                        ?: throw CameraFailure("CAMERA_CODEC_FAILED")
+                    bytes.position(info.offset)
+                    bytes.limit(info.offset + info.size)
+                    val origin = firstPts ?: info.presentationTimeUs.also { firstPts = it }
+                    val pts = info.presentationTimeUs - origin
+                    if (pts < 0 || pts <= lastPts) throw CameraFailure("CAMERA_CODEC_FAILED")
+                    if (lastPts >= 0) timings.maxCodecPtsGapUs = maxOf(timings.maxCodecPtsGapUs, pts - lastPts)
+                    lastPts = pts
+                    if (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0) {
+                      lastKeyframePts?.let { previous ->
+                        timings.maxKeyframePtsGapUs = maxOf(timings.maxKeyframePtsGapUs, pts - previous)
+                      }
+                      lastKeyframePts = pts
+                    }
+                    val normalized = MediaCodec.BufferInfo().apply {
+                      set(0, info.size, pts, info.flags)
+                    }
+                    stage = "CAMERA_MUXER_FAILED"
+                    val muxBegan = System.nanoTime()
+                    try {
+                      muxer.writeSampleData(track, bytes.slice(),
+                          MuxerUtil.getMuxerBufferInfoFromMediaCodecBufferInfo(normalized))
+                    } catch (_: Exception) {
+                      throw CameraFailure("CAMERA_MUXER_FAILED")
+                    } finally {
+                      timings.maxMuxWriteNs = maxOf(timings.maxMuxWriteNs, System.nanoTime() - muxBegan)
+                    }
+                    encoded.incrementAndGet()
+                    observeFragmentRelease()
+                  }
+                } finally {
+                  stage = "CAMERA_CODEC_FAILED"
+                  encoder.releaseOutputBuffer(index, false)
+                }
               }
             }
           }
+        } finally {
+          timings.maxDrainWorkNs = maxOf(timings.maxDrainWorkNs, System.nanoTime() - drainBegan)
         }
-        val slots = parser.emittedSlots
-        completed.set(slots)
-        if (slots != previousFragments) {
-          lastFragment = System.nanoTime()
-          previousFragments = slots
+        observeFragmentRelease()
+        if (tick != null || encoded.get() != encodedBeforeDrain || now - lastProgress >= 1_000_000_000L) {
+          publishPacing(renderer, pacer, timings)
         }
         if (now - lastProgress >= 1_000_000_000L) {
           event("PROGRESS", "CAMERA_PROGRESS")
           lastProgress = now
         }
         if (!parser.isComplete && !stopping.get()) {
-          LockSupport.parkNanos(minOf(2_000_000L, (nextRender - System.nanoTime()).coerceAtLeast(1L)))
+          val untilNext = if (pacer.isStarted) pacer.nextDeadlineNs - System.nanoTime() else 2_000_000L
+          LockSupport.parkNanos(minOf(2_000_000L, untilNext.coerceAtLeast(1L)))
           if (Thread.interrupted() && !stopping.get()) throw CameraFailure("CAMERA_INTERRUPTED")
         }
       }
       quotaComplete = parser.isComplete
       completed.set(parser.emittedSlots)
     } catch (problem: CameraFailure) {
+      publishPacing(renderer, pacer, timings)
       if (!stopping.get()) fail(problem.code)
     } catch (_: InterruptedException) {
+      publishPacing(renderer, pacer, timings)
       if (!stopping.get()) fail("CAMERA_INTERRUPTED")
     } catch (_: Exception) {
+      publishPacing(renderer, pacer, timings)
       if (!stopping.get()) fail(stage)
     } finally {
       // A stop interrupt wakes waits; it must not skip the bounded native-resource cleanup.
@@ -330,6 +420,7 @@ class PhoneCameraProducer(
           joinCallbackThread(thread)
         }
       }
+      publishPacing(renderer, pacer, timings)
       if (cleanupFailed.get()) {
         fail("CAMERA_CLEANUP_FAILED")
       } else if (quotaComplete && !failureSent.get()) {
